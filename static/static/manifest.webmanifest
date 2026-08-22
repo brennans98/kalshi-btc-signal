@@ -1,8 +1,0 @@
-{
-  "name": "BTC 15m Signal",
-  "short_name": "BTC Signal",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#0a1020",
-  "theme_color": "#0a1020"
-}
