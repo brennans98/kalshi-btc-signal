@@ -145,7 +145,7 @@ async def coinbase_worker():
 def choose_market(markets):
     open_markets = [
     market for market in markets
-    if market.get("status") == "active" and market.get("ticker")
+    if market.get("status") == "open" and market.get("ticker")
 ]
 
     if not open_markets:
