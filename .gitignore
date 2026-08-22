@@ -221,3 +221,5 @@ __marimo__/
 *.pem
 *.key
 secrets/
+__pycache__/
+*.pyc
