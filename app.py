@@ -17,7 +17,7 @@ STATIC_DIR = BASE_DIR / "static"
 COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_PRODUCT = "BTC-USD"
 
-KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_API = KALSHI_API = "https://external-api.kalshi.com/trade-api/v2"
 KALSHI_SERIES_TICKER = os.getenv("KALSHI_SERIES_TICKER", "KXBTC15M")
 
 trades = deque(maxlen=20000)
