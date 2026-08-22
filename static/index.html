@@ -19,9 +19,7 @@
       --yellow: #ffc857;
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
@@ -67,17 +65,9 @@
       line-height: 1.05;
     }
 
-    .up {
-      color: var(--green);
-    }
-
-    .down {
-      color: var(--red);
-    }
-
-    .neutral {
-      color: var(--yellow);
-    }
+    .up { color: var(--green); }
+    .down { color: var(--red); }
+    .neutral { color: var(--yellow); }
 
     #confidence {
       font-size: 21px;
@@ -106,9 +96,7 @@
       padding: 14px;
     }
 
-    .wide {
-      grid-column: 1 / -1;
-    }
+    .wide { grid-column: 1 / -1; }
 
     .label {
       color: var(--muted);
@@ -191,29 +179,30 @@
         }
 
         const data = await response.json();
+        const signal = data.signal;
         const actionElement = document.getElementById("action");
 
-        actionElement.textContent = data.action;
+        actionElement.textContent = signal.action;
         actionElement.className = "";
 
-        if (data.action.includes("UP")) {
+        if (signal.action.includes("UP")) {
           actionElement.classList.add("up");
-        } else if (data.action.includes("DOWN")) {
+        } else if (signal.action.includes("DOWN")) {
           actionElement.classList.add("down");
         } else {
           actionElement.classList.add("neutral");
         }
 
         document.getElementById("confidence").textContent =
-          data.confidence + "% confidence";
+          signal.confidence + "% confidence";
 
-        document.getElementById("reason").textContent = data.reason;
-        document.getElementById("price").textContent = formatPrice(data.price);
-        document.getElementById("move15").textContent = formatPercent(data.move_15);
-        document.getElementById("move60").textContent = formatPercent(data.move_60);
+        document.getElementById("reason").textContent = signal.reason;
+        document.getElementById("price").textContent = formatPrice(data.btc_usd);
+        document.getElementById("move15").textContent = formatPercent(data.move_15s);
+        document.getElementById("move60").textContent = formatPercent(data.move_60s);
 
         document.getElementById("status").textContent =
-          data.connected ? "BTC Feed: LIVE" : "BTC Feed: reconnecting";
+          data.spot_connected ? "BTC Feed: LIVE" : "BTC Feed: reconnecting";
       } catch (error) {
         document.getElementById("status").textContent = "Dashboard reconnecting";
       }
