@@ -164,10 +164,10 @@ async def kalshi_market_discovery_worker():
                 response = await client.get(
                     f"{KALSHI_API}/markets",
                     params={
-                        "series_ticker": KALSHI_SERIES_TICKER,
-                        "status": "open",
-                        "limit": 100,
-                    },
+    "series_ticker": KALSHI_SERIES_TICKER,
+    "status": "active",
+    "limit": 100,
+},
                 )
                 response.raise_for_status()
                 payload = response.json()
