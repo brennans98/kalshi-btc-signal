@@ -165,7 +165,7 @@ async def kalshi_market_discovery_worker():
                     f"{KALSHI_API}/markets",
                     params={
     "series_ticker": KALSHI_SERIES_TICKER,
-    "status": "active",
+    "status": "open",
     "limit": 100,
 },
                 )
