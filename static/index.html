@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a1020">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <title>BTC Signal</title>
+
+  <style>
+    :root {
+      --background: #0a1020;
+      --panel: #151f38;
+      --border: #2b395a;
+      --text: #f5f7ff;
+      --muted: #a8b5d2;
+      --green: #37df8b;
+      --red: #ff6173;
+      --yellow: #ffc857;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    main {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 6px 0 16px;
+    }
+
+    h1 {
+      font-size: 19px;
+      margin: 0;
+    }
+
+    #status {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .signal-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 30px 18px;
+      text-align: center;
+    }
+
+    #action {
+      font-size: clamp(40px, 12vw, 75px);
+      font-weight: 900;
+      line-height: 1.05;
+    }
+
+    .up {
+      color: var(--green);
+    }
+
+    .down {
+      color: var(--red);
+    }
+
+    .neutral {
+      color: var(--yellow);
+    }
+
+    #confidence {
+      font-size: 21px;
+      font-weight: 700;
+      margin-top: 12px;
+    }
+
+    #reason {
+      color: var(--muted);
+      line-height: 1.4;
+      margin: 12px auto 0;
+      max-width: 530px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+    }
+
+    .wide {
+      grid-column: 1 / -1;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .value {
+      font-size: 21px;
+      font-weight: 750;
+      margin-top: 5px;
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin: 18px 2px;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <header>
+      <h1>BTC 15m Signal</h1>
+      <span id="status">Connecting…</span>
+    </header>
+
+    <section class="signal-card">
+      <div id="action" class="neutral">NO TRADE</div>
+      <div id="confidence">0% confidence</div>
+      <div id="reason">Loading live BTC data…</div>
+    </section>
+
+    <section class="grid">
+      <div class="card wide">
+        <div class="label">BTC-USD Live Price</div>
+        <div class="value" id="price">—</div>
+      </div>
+
+      <div class="card">
+        <div class="label">15-second move</div>
+        <div class="value" id="move15">—</div>
+      </div>
+
+      <div class="card">
+        <div class="label">60-second move</div>
+        <div class="value" id="move60">—</div>
+      </div>
+    </section>
+
+    <footer>
+      Live BTC market-data dashboard. A candidate signal is not a guaranteed result;
+      NO TRADE means the available conditions do not align.
+    </footer>
+  </main>
+
+  <script>
+    function formatPrice(value) {
+      if (value === null || value === undefined) return "—";
+
+      return "$" + Number(value).toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      });
+    }
+
+    function formatPercent(value) {
+      if (value === null || value === undefined) return "—";
+
+      return (value >= 0 ? "+" : "") + Number(value).toFixed(3) + "%";
+    }
+
+    async function updateDashboard() {
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+
+        if (!response.ok) {
+          throw new Error("Server unavailable");
+        }
+
+        const data = await response.json();
+        const actionElement = document.getElementById("action");
+
+        actionElement.textContent = data.action;
+        actionElement.className = "";
+
+        if (data.action.includes("UP")) {
+          actionElement.classList.add("up");
+        } else if (data.action.includes("DOWN")) {
+          actionElement.classList.add("down");
+        } else {
+          actionElement.classList.add("neutral");
+        }
+
+        document.getElementById("confidence").textContent =
+          data.confidence + "% confidence";
+
+        document.getElementById("reason").textContent = data.reason;
+        document.getElementById("price").textContent = formatPrice(data.price);
+        document.getElementById("move15").textContent = formatPercent(data.move_15);
+        document.getElementById("move60").textContent = formatPercent(data.move_60);
+
+        document.getElementById("status").textContent =
+          data.connected ? "BTC Feed: LIVE" : "BTC Feed: reconnecting";
+      } catch (error) {
+        document.getElementById("status").textContent = "Dashboard reconnecting";
+      }
+    }
+
+    updateDashboard();
+    setInterval(updateDashboard, 1000);
+  </script>
+</body>
+</html>
