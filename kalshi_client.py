@@ -7,13 +7,14 @@ Signing contract:
     headers   KALSHI-ACCESS-KEY / KALSHI-ACCESS-SIGNATURE / KALSHI-ACCESS-TIMESTAMP
 
 Authentication failures raise KalshiAuthError, deliberately a different type
-from KalshiApiError, so the trading loop can halt on a bad key instead of
-retrying a request that will never succeed.
+from KalshiApiError, so the loop can halt on a bad key instead of retrying a
+request that will never succeed.
 
-Scalping needs the sell side, which the previous version lacked entirely: it
-could only open positions. Exits use immediate-or-cancel so a stop cannot rest
-unfilled while price keeps moving, with a fallback for venues that reject the
-time_in_force field.
+Entries are fill-or-kill and exits are immediate-or-cancel: a scalper's edge is
+measured against a specific price, so a resting order that fills later fills
+against a decision that has already expired. Both are limit orders -- a market
+order on a thin 15-minute book can fill cents away from the price the edge was
+calculated against.
 """
 
 import base64
@@ -110,8 +111,8 @@ class KalshiClient:
             headers = self._sign(method, endpoint)
 
         try:
-            async with httpx.AsyncClient(timeout=15) as http_client:
-                response = await http_client.request(
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.request(
                     method.upper(),
                     f"{self.base_url}{endpoint}",
                     params=params,
@@ -143,11 +144,15 @@ class KalshiClient:
 
     # ---- market data (public) ----
 
-    async def get_markets(self, series_ticker, status="open", limit=100):
+    async def get_markets(self, series_ticker=None, status="open", limit=100):
         return await self.request(
             "GET",
             "/markets",
-            params={"series_ticker": series_ticker, "status": status, "limit": limit},
+            params={
+                "series_ticker": series_ticker or config.settings.series_ticker,
+                "status": status,
+                "limit": limit,
+            },
             authenticate=False,
         )
 
@@ -183,23 +188,7 @@ class KalshiClient:
 
     # ---- orders ----
 
-    async def _place(self, body):
-        """POST an order, retrying once without time_in_force if that is rejected.
-
-        Kalshi has changed the accepted values for this field over time. A stop
-        that fails to place because of a field name is worse than a stop that
-        places as a plain limit, so degrade rather than abort.
-        """
-        try:
-            return await self.request("POST", self.order_path, body=body)
-        except KalshiApiError as error:
-            if "time_in_force" in str(error) and "time_in_force" in body:
-                self._tif_supported = False
-                retry = {key: value for key, value in body.items() if key != "time_in_force"}
-                return await self.request("POST", self.order_path, body=retry)
-            raise
-
-    def _order_body(self, ticker, action, side, count, price_cents, client_order_id, tif):
+    async def _order(self, action, ticker, side, count, price_cents, client_order_id, tif):
         body = {
             "ticker": ticker,
             "action": action,
@@ -209,49 +198,44 @@ class KalshiClient:
             "client_order_id": client_order_id,
         }
 
-        price = max(1, min(99, int(price_cents)))
         if side == "yes":
-            body["yes_price"] = price
+            body["yes_price"] = int(price_cents)
         else:
-            body["no_price"] = price
+            body["no_price"] = int(price_cents)
 
         if tif and self._tif_supported:
             body["time_in_force"] = tif
 
-        return body
+        try:
+            return await self.request("POST", self.order_path, body=body)
+        except KalshiApiError as error:
+            # Some environments reject an unknown time_in_force outright. Retry
+            # once without it rather than losing an exit to a schema quibble.
+            if tif and self._tif_supported and "time_in_force" in str(error):
+                self._tif_supported = False
+                body.pop("time_in_force", None)
+                return await self.request("POST", self.order_path, body=body)
+            raise
 
-    async def create_order(
-        self, ticker, side, count, price_cents, client_order_id, action="buy"
-    ):
-        """Open a position with a fill-or-kill limit order.
-
-        Limit, not market: a market order on a thin 15-minute book can fill far
-        from the price the edge was calculated against, which would silently
-        invalidate the decision that produced it. Fill-or-kill because a
-        partially filled scalp entry leaves the ladder sizing wrong.
-        """
-        body = self._order_body(
-            ticker, action, side, count, price_cents, client_order_id, "fill_or_kill"
+    async def create_order(self, ticker, side, count, price_cents, client_order_id):
+        """Open a position. Fill-or-kill: a partial scalp entry is not wanted."""
+        return await self._order(
+            "buy", ticker, side, count, price_cents, client_order_id, "fill_or_kill"
         )
-        return await self._place(body)
 
-    async def sell(self, ticker, side, count, price_cents, client_order_id, tif=None):
-        """Close all or part of a position.
+    async def sell(self, ticker, side, count, price_cents, client_order_id):
+        """Close part or all of a position.
 
-        Immediate-or-cancel by default: an exit that rests unfilled is not an
-        exit. Anything not filled is re-offered on the next tick at the new bid,
-        which is the correct behaviour for a stop in a moving market.
+        Immediate-or-cancel, not fill-or-kill: a partial exit at the ladder's
+        target is strictly better than no exit, and whatever does not fill is
+        retried on the next tick at the new bid.
         """
-        body = self._order_body(
-            ticker,
-            "sell",
-            side,
-            count,
-            price_cents,
-            client_order_id,
-            tif or config.settings.exit_tif,
+        return await self._order(
+            "sell", ticker, side, count, price_cents, client_order_id, config.settings.exit_tif
         )
-        return await self._place(body)
+
+    async def cancel_order(self, order_id):
+        return await self.request("DELETE", f"/portfolio/orders/{order_id}")
 
     async def selftest(self):
         """Verify signing and read-only portfolio access without placing an order."""
