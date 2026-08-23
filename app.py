@@ -40,6 +40,7 @@ state = {
     "orderbook": None,
     "book_error": None,
     "book_updated_at": None,
+    "book_source": None,
     "kalshi_checked_at": None,
 }
 
@@ -47,6 +48,12 @@ app = FastAPI(title="BTC 15m Scalper")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 client = KalshiClient()
+
+# Reconstructed book state for the WebSocket path. orderbook_snapshot gives the
+# full book; orderbook_delta gives one price level change at a time. Kept
+# separate from state["orderbook"] (the published, policy-consumable shape) so
+# a partial or out-of-order delta never corrupts what the trader reads.
+_local_book = {"ticker": None, "yes": {}, "no": {}}
 
 
 def pct_move(seconds_ago):
@@ -99,6 +106,7 @@ def api_payload():
             "book": policy.book_snapshot(state["orderbook"]),
             "book_error": state["book_error"],
             "book_updated_at": state["book_updated_at"],
+            "book_source": state["book_source"],
         },
         "trader": trader.snapshot(),
         "config": config.settings.public_view(),
@@ -198,26 +206,165 @@ async def kalshi_market_discovery_worker():
         await asyncio.sleep(20)
 
 
-async def orderbook_worker():
-    """Poll the book for the market being traded.
+# ------------------------------------------------------------- Kalshi orderbook
 
-    Without this the entry model has nothing to compare fair value against,
-    which is exactly why the original dashboard could only ever say NO TRADE.
+
+def _reset_local_book(ticker):
+    _local_book["ticker"] = ticker
+    _local_book["yes"] = {}
+    _local_book["no"] = {}
+
+
+def _apply_book_levels(side, levels):
+    """levels: list of [price_cents, size] pairs representing the full side."""
+    book_side = {}
+    for level in levels or []:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        try:
+            price, size = int(level[0]), int(level[1])
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            book_side[price] = size
+    _local_book[side] = book_side
+
+
+def _apply_book_delta(side, price, delta):
+    try:
+        price = int(price)
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return
+    current = _local_book[side].get(price, 0) + delta
+    if current > 0:
+        _local_book[side][price] = current
+    else:
+        _local_book[side].pop(price, None)
+
+
+def _publish_local_book():
+    state["orderbook"] = {
+        "orderbook": {
+            "yes": [[price, size] for price, size in _local_book["yes"].items()],
+            "no": [[price, size] for price, size in _local_book["no"].items()],
+        }
+    }
+    state["book_error"] = None
+    state["book_updated_at"] = int(time.time())
+    state["book_source"] = "websocket"
+
+
+def _handle_ws_message(raw_message, ticker):
+    data = json.loads(raw_message)
+    msg_type = data.get("type")
+    body = data.get("msg") or {}
+
+    if body.get("market_ticker") not in (None, ticker):
+        return  # a stale message for a market we've since rolled off of
+
+    if msg_type == "orderbook_snapshot":
+        _apply_book_levels("yes", body.get("yes"))
+        _apply_book_levels("no", body.get("no"))
+        _publish_local_book()
+
+    elif msg_type == "orderbook_delta":
+        side = body.get("side")
+        price = body.get("price")
+        delta = body.get("delta")
+        if side in ("yes", "no") and price is not None and delta is not None:
+            _apply_book_delta(side, price, delta)
+            _publish_local_book()
+
+    elif msg_type == "error":
+        code = (body or {}).get("code")
+        message = (body or {}).get("msg")
+        state["book_error"] = f"ws error {code}: {message}"[:180]
+
+
+async def kalshi_orderbook_ws_worker():
+    """Stream orderbook_delta over WebSocket instead of REST polling.
+
+    Kalshi pushes book changes the instant they happen; a 2-second REST poll
+    means every decision is made against a price that may already be gone.
+    The REST fallback worker below only writes when this path has gone stale,
+    so the fast path always wins while it is healthy.
+    """
+    backoff = 1
+
+    while True:
+        ticker = (state["market"] or {}).get("ticker")
+
+        if not ticker or not client.has_credentials:
+            await asyncio.sleep(2)
+            continue
+
+        if _local_book["ticker"] != ticker:
+            _reset_local_book(ticker)
+
+        try:
+            headers = client.sign_ws_handshake()
+            async with websockets.connect(
+                client.ws_url,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as websocket:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": 1,
+                            "cmd": "subscribe",
+                            "params": {
+                                "channels": ["orderbook_delta"],
+                                "market_tickers": [ticker],
+                            },
+                        }
+                    )
+                )
+
+                backoff = 1
+                subscribed_ticker = ticker
+
+                async for raw_message in websocket:
+                    if (state["market"] or {}).get("ticker") != subscribed_ticker:
+                        break  # market rolled to the next contract, reconnect on it
+                    _handle_ws_message(raw_message, subscribed_ticker)
+
+        except Exception as error:
+            state["book_error"] = f"ws: {str(error)[:160]}"
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15)
+
+
+async def orderbook_rest_fallback_worker():
+    """REST polling safety net.
+
+    Only writes when the WebSocket book has gone stale (or was never
+    established), so the fast path always wins when it is healthy.
     """
     while True:
         ticker = (state["market"] or {}).get("ticker")
 
         if not ticker:
-            state["orderbook"] = None
             await asyncio.sleep(2)
             continue
 
-        try:
-            state["orderbook"] = await client.get_orderbook(ticker)
-            state["book_error"] = None
-            state["book_updated_at"] = int(time.time())
-        except Exception as error:
-            state["book_error"] = str(error)[:180]
+        book_age = (
+            time.time() - state["book_updated_at"] if state["book_updated_at"] else None
+        )
+        is_stale = book_age is None or book_age > (config.settings.book_poll_seconds * 3)
+
+        if is_stale:
+            try:
+                fresh = await client.get_orderbook(ticker)
+                if (state["market"] or {}).get("ticker") == ticker:
+                    state["orderbook"] = fresh
+                    state["book_error"] = None
+                    state["book_updated_at"] = int(time.time())
+                    state["book_source"] = "rest_fallback"
+            except Exception as error:
+                state["book_error"] = f"rest: {str(error)[:160]}"
 
         await asyncio.sleep(config.settings.book_poll_seconds)
 
@@ -226,7 +373,8 @@ async def orderbook_worker():
 async def startup():
     asyncio.create_task(coinbase_worker())
     asyncio.create_task(kalshi_market_discovery_worker())
-    asyncio.create_task(orderbook_worker())
+    asyncio.create_task(kalshi_orderbook_ws_worker())
+    asyncio.create_task(orderbook_rest_fallback_worker())
 
     if config.settings.is_enabled:
         asyncio.create_task(trader.loop(client, current_signal, current_market))
@@ -283,6 +431,31 @@ async def api_selftest(x_admin_token: str = Header(default="")):
     """Verify credentials and signing without placing an order."""
     require_admin(x_admin_token)
     return await client.selftest()
+
+
+@app.get("/api/trader/tier")
+async def api_tier(x_admin_token: str = Header(default="")):
+    """Current API usage tier and token-bucket limits."""
+    require_admin(x_admin_token)
+    try:
+        return await client.get_api_limits()
+    except (KalshiApiError, KalshiAuthError) as error:
+        return {"ok": False, "error": str(error)[:200]}
+
+
+@app.post("/api/trader/tier/upgrade")
+async def api_tier_upgrade(x_admin_token: str = Header(default="")):
+    """Request the Advanced usage tier.
+
+    Requires at least 1 of the account's last 100 Predictions orders to have
+    been placed via the API. Dryrun mode never satisfies this since it never
+    calls create_order/sell -- only a real (live) order counts.
+    """
+    require_admin(x_admin_token)
+    try:
+        return await client.upgrade_api_tier()
+    except (KalshiApiError, KalshiAuthError) as error:
+        return {"ok": False, "error": str(error)[:200]}
 
 
 @app.post("/api/trader/halt")
