@@ -6,6 +6,10 @@ Signing contract:
     signature = base64(RSA-PSS(SHA256, salt_length=DIGEST_LENGTH)) over message
     headers   KALSHI-ACCESS-KEY / KALSHI-ACCESS-SIGNATURE / KALSHI-ACCESS-TIMESTAMP
 
+The WebSocket endpoint (/trade-api/ws/v2) uses the identical RSA-PSS scheme but
+a different path prefix than REST, so it is signed separately rather than
+reusing _sign(), which is hardcoded to the REST base_url's path.
+
 Authentication failures raise KalshiAuthError, deliberately a different type
 from KalshiApiError, so the trading loop can halt on a bad key instead of
 retrying a request that will never succeed.
@@ -26,6 +30,10 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import config
 
+WS_PATH = "/trade-api/ws/v2"
+PROD_WS_URL = "wss://api.elections.kalshi.com" + WS_PATH
+DEMO_WS_URL = "wss://demo-api.kalshi.co" + WS_PATH
+
 
 class KalshiAuthError(RuntimeError):
     """Credentials are missing, malformed, or rejected. Not retryable."""
@@ -40,7 +48,9 @@ def _load_private_key(raw):
         return None
 
     # Railway variables commonly arrive with literal backslash-n sequences.
-    pem = raw.replace("\\n", "\n").strip()
+    pem = raw.replace("\
+", "
+").strip()
 
     try:
         return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
@@ -57,6 +67,7 @@ class KalshiClient:
         self.environment = cfg.kalshi_env
         self.key_id = cfg.key_id or None
         self.order_path = cfg.order_path
+        self.ws_url = PROD_WS_URL if cfg.kalshi_env == "prod" else DEMO_WS_URL
         self._key_error = None
         self._http = None
         # Set if the venue rejects time_in_force, so we stop sending it.
@@ -98,25 +109,45 @@ class KalshiClient:
             return "KALSHI_PRIVATE_KEY is not set"
         return None
 
-    def _sign(self, method, endpoint):
-        timestamp = str(int(time.time() * 1000))
-        path = urlparse(self.base_url).path + endpoint.split("?")[0]
-        message = f"{timestamp}{method.upper()}{path}".encode("utf-8")
-
+    def _sign_message(self, message_text):
         signature = self.private_key.sign(
-            message,
+            message_text.encode("utf-8"),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
                 salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def _sign(self, method, endpoint):
+        timestamp = str(int(time.time() * 1000))
+        path = urlparse(self.base_url).path + endpoint.split("?")[0]
+        message = f"{timestamp}{method.upper()}{path}"
 
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "KALSHI-ACCESS-SIGNATURE": self._sign_message(message),
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
             "Content-Type": "application/json",
+        }
+
+    def sign_ws_handshake(self):
+        """KALSHI-ACCESS-* headers for the /trade-api/ws/v2 WebSocket handshake.
+
+        Same RSA-PSS scheme as REST, but signed over the WS path directly since
+        it does not sit under the /trade-api/v2 REST prefix that _sign() assumes.
+        """
+        if not self.has_credentials:
+            raise KalshiAuthError(self.credential_error)
+
+        timestamp = str(int(time.time() * 1000))
+        message = f"{timestamp}GET{WS_PATH}"
+
+        return {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": self._sign_message(message),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
         }
 
     async def request(self, method, endpoint, params=None, body=None, authenticate=True):
@@ -201,6 +232,23 @@ class KalshiClient:
         if ticker:
             params["ticker"] = ticker
         return await self.request("GET", "/portfolio/fills", params=params)
+
+    # ---- account tier ----
+
+    async def get_api_limits(self):
+        """Current usage tier and token-bucket limits."""
+        return await self.request("GET", "/account/api_limits")
+
+    async def upgrade_api_tier(self):
+        """Request the Advanced usage tier.
+
+        Kalshi's own criterion: at least 1 of the account's last 100
+        Predictions orders must have been created via the API. Dryrun mode
+        never satisfies this, since it never calls create_order/sell -- only
+        a real (live) order counts. Safe to call speculatively; Kalshi
+        returns 403 with a clear message if the criterion is not met yet.
+        """
+        return await self.request("POST", "/account/api_usage_level/upgrade", body={})
 
     # ---- orders ----
 
