@@ -1,50 +1,30 @@
-"""The decision model that was missing.
+"""The scalp entry model.
 
-The previous signal() computed momentum inputs and then returned a hardcoded
-NO TRADE, because nothing ever compared a fair value against the Kalshi book.
-This module does that comparison.
+What this asks is narrower than "will this contract settle yes". It asks:
+is this contract mispriced right now, and can it travel far enough, soon
+enough, for the exit ladder to bank a few cents before the hold window or the
+settlement guard closes the trade?
 
-Approach: estimate realized volatility from the live trade tape, price the
-binary as a driftless lognormal, and compare that probability against what the
-book is actually asking. Trade only when the ask is enough below fair value to
-cover the cost of being wrong about the volatility estimate.
+Three gates matter more here than in a hold-to-settlement design:
 
-Every rejection returns a specific reason string. A dashboard that says
-"edge 0.4c below the 3.0c minimum" is debuggable; a bare NO TRADE is not.
+  1. Expected move. If the contract cannot plausibly move the small target's
+     worth of cents inside the hold window, the edge is unharvestable no matter
+     how real it is. Sitting in a correctly-priced-but-static contract is how a
+     scalper bleeds fees and time.
+  2. Exit liquidity. The entry is only half the trade. If there is no resting
+     size on the side we would sell into, we can enter and not get out.
+  3. Spread. Crossing a wide spread means starting the scalp several cents
+     underwater, which the small target may never recover.
+
+Every rejection returns a specific reason. "Expected move 1.8c short of the 3c
+small target" is debuggable; a bare NO TRADE is not.
 """
 
 import math
-import os
 import time
 from datetime import datetime, timezone
 
-
-def _env_float(name, default):
-    try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _env_int(name, default):
-    try:
-        return int(float(os.getenv(name, default)))
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def settings():
-    return {
-        "min_edge_cents": _env_float("MIN_EDGE_CENTS", 3.0),
-        "min_confidence": _env_int("MIN_CONFIDENCE", 58),
-        "max_spread_cents": _env_int("MAX_SPREAD_CENTS", 8),
-        "min_price_cents": _env_int("MIN_PRICE_CENTS", 8),
-        "max_price_cents": _env_int("MAX_PRICE_CENTS", 92),
-        "min_seconds_to_close": _env_int("MIN_SECONDS_TO_CLOSE", 75),
-        "max_seconds_to_close": _env_int("MAX_SECONDS_TO_CLOSE", 900),
-        "min_history_seconds": _env_int("MIN_HISTORY_SECONDS", 120),
-        "stale_feed_seconds": _env_float("STALE_FEED_SECONDS", 5.0),
-    }
+import config
 
 
 def _no_trade(reason, **extra):
@@ -57,13 +37,20 @@ def _normal_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def realized_vol_per_second(trades, window_seconds=300):
-    """Annualization-free volatility: standard deviation of 1-second log returns.
+def _normal_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def realized_vol_per_second(trades, window_seconds=None):
+    """Standard deviation of one-second log returns.
 
     Sampling at one second rather than per-trade keeps the estimate from being
     inflated by trade-rate bursts, which is the usual way a naive tick-level
-    estimate produces a fake edge.
+    estimate manufactures a fake edge.
     """
+    cfg = config.settings
+    window_seconds = window_seconds or cfg.vol_window_seconds
+
     if len(trades) < 30:
         return None
 
@@ -94,15 +81,37 @@ def realized_vol_per_second(trades, window_seconds=300):
     return sigma if sigma > 0 else None
 
 
-def probability_above(spot, strike, sigma_per_second, seconds_remaining):
-    """P(spot settles above strike) under driftless GBM."""
+def standard_score(spot, strike, sigma_per_second, seconds_remaining):
+    """The z of a driftless lognormal settling above strike."""
     if spot <= 0 or strike <= 0 or sigma_per_second <= 0 or seconds_remaining <= 0:
         return None
 
     total_sigma = sigma_per_second * math.sqrt(seconds_remaining)
-    numerator = math.log(spot / strike) - 0.5 * (total_sigma ** 2)
+    if total_sigma <= 0:
+        return None
 
-    return _normal_cdf(numerator / total_sigma)
+    return (math.log(spot / strike) - 0.5 * (total_sigma ** 2)) / total_sigma
+
+
+def probability_above(spot, strike, sigma_per_second, seconds_remaining):
+    z = standard_score(spot, strike, sigma_per_second, seconds_remaining)
+    return None if z is None else _normal_cdf(z)
+
+
+def expected_move_cents(z, horizon_seconds, seconds_remaining):
+    """Roughly how many cents this contract's price travels over the horizon.
+
+    prob = Phi(z) with z scaling as 1/sqrt(T), so a one-sigma spot move over a
+    horizon h shifts z by sqrt(h / T). In price terms that is
+    phi(z) * sqrt(h / T) * 100 cents. Crude, but it is the right question: a
+    deep out-of-the-money contract with a tiny phi(z) barely moves even when
+    spot does, and is therefore not scalpable.
+    """
+    if z is None or seconds_remaining <= 0 or horizon_seconds <= 0:
+        return None
+
+    horizon = min(horizon_seconds, seconds_remaining)
+    return _normal_pdf(z) * math.sqrt(horizon / seconds_remaining) * 100.0
 
 
 def market_strike(market):
@@ -132,21 +141,26 @@ def market_strike(market):
     return None, "unresolved"
 
 
-def seconds_to_close(market):
+def close_epoch(market):
     close_time = (market or {}).get("close_time")
     if not close_time:
         return None
 
     try:
         parsed = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, AttributeError):
         return None
 
-    return (parsed - datetime.now(timezone.utc)).total_seconds()
+    return parsed.timestamp()
 
 
-def best_levels(orderbook):
-    """Return (yes_ask, no_ask, yes_bid, no_bid) in cents.
+def seconds_to_close(market):
+    epoch = close_epoch(market)
+    return None if epoch is None else epoch - time.time()
+
+
+def book_snapshot(orderbook):
+    """Top of book with resting sizes, in cents.
 
     Kalshi quotes both sides as bids. The ask for yes is 100 minus the best
     bid for no, and vice versa.
@@ -154,37 +168,56 @@ def best_levels(orderbook):
     book = (orderbook or {}).get("orderbook") or {}
 
     def top(levels):
-        prices = [
-            int(level[0])
-            for level in (levels or [])
-            if isinstance(level, (list, tuple)) and len(level) >= 2 and int(level[1]) > 0
-        ]
-        return max(prices) if prices else None
+        best_price = None
+        best_size = 0
 
-    yes_bid = top(book.get("yes"))
-    no_bid = top(book.get("no"))
+        for level in levels or []:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            try:
+                price, size = int(level[0]), int(level[1])
+            except (TypeError, ValueError):
+                continue
+            if size > 0 and (best_price is None or price > best_price):
+                best_price, best_size = price, size
 
-    yes_ask = 100 - no_bid if no_bid is not None else None
-    no_ask = 100 - yes_bid if yes_bid is not None else None
+        return best_price, best_size
 
-    return yes_ask, no_ask, yes_bid, no_bid
+    yes_bid, yes_bid_size = top(book.get("yes"))
+    no_bid, no_bid_size = top(book.get("no"))
+
+    return {
+        "yes_bid": yes_bid,
+        "yes_bid_size": yes_bid_size,
+        "no_bid": no_bid,
+        "no_bid_size": no_bid_size,
+        "yes_ask": None if no_bid is None else 100 - no_bid,
+        "no_ask": None if yes_bid is None else 100 - yes_bid,
+        "yes_spread": None if (yes_bid is None or no_bid is None) else (100 - no_bid) - yes_bid,
+    }
+
+
+def bid_for_side(snapshot, side):
+    """The price we could sell this side into right now."""
+    return (snapshot or {}).get("yes_bid" if side == "yes" else "no_bid")
 
 
 def evaluate(trades, market, orderbook):
     """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'."""
-    config = settings()
+    cfg = config.settings
 
     if not trades:
         return _no_trade("Waiting for live BTC-USD trades")
 
     spot_age = time.time() - trades[-1][0]
-    if spot_age > config["stale_feed_seconds"]:
+    if spot_age > cfg.stale_feed_seconds:
         return _no_trade(f"Coinbase BTC feed is stale ({spot_age:.0f}s since last trade)")
 
     history = trades[-1][0] - trades[0][0]
-    if history < config["min_history_seconds"]:
-        remaining = int(config["min_history_seconds"] - history)
-        return _no_trade(f"Building volatility history ({remaining}s remaining)")
+    if history < cfg.min_history_seconds:
+        return _no_trade(
+            f"Building volatility history ({int(cfg.min_history_seconds - history)}s remaining)"
+        )
 
     if not market or not market.get("ticker"):
         return _no_trade("No open BTC-15m market discovered")
@@ -197,26 +230,33 @@ def evaluate(trades, market, orderbook):
     if remaining is None:
         return _no_trade("Market close time is unavailable")
 
-    if remaining < config["min_seconds_to_close"]:
-        return _no_trade(f"Too close to settlement ({remaining:.0f}s remaining)")
+    if remaining < cfg.min_seconds_to_close:
+        return _no_trade(
+            f"Too little runway to scalp ({remaining:.0f}s to close, "
+            f"{cfg.min_seconds_to_close}s required)"
+        )
 
-    if remaining > config["max_seconds_to_close"]:
+    if remaining > cfg.max_seconds_to_close:
         return _no_trade(f"Outside the trading window ({remaining:.0f}s to close)")
 
     sigma = realized_vol_per_second(trades)
     if sigma is None:
         return _no_trade("Insufficient one-second samples to estimate volatility")
 
-    yes_ask, no_ask, yes_bid, no_bid = best_levels(orderbook)
+    snapshot = book_snapshot(orderbook)
+    yes_ask, no_ask = snapshot["yes_ask"], snapshot["no_ask"]
+
     if yes_ask is None or no_ask is None:
         return _no_trade("Waiting for a two-sided Kalshi book")
 
-    spread = yes_ask - (yes_bid if yes_bid is not None else 0)
-    if spread > config["max_spread_cents"]:
-        return _no_trade(f"Book spread too wide ({spread}c)")
+    spread = snapshot["yes_spread"]
+    if spread is not None and spread > cfg.max_spread_cents:
+        return _no_trade(f"Book spread too wide to scalp ({spread}c)")
 
     spot = trades[-1][1]
-    fair_yes = probability_above(spot, strike, sigma, remaining)
+    z = standard_score(spot, strike, sigma, remaining)
+    fair_yes = None if z is None else _normal_cdf(z)
+
     if fair_yes is None:
         return _no_trade("Fair value could not be computed")
 
@@ -228,10 +268,20 @@ def evaluate(trades, market, orderbook):
     else:
         side, ask, edge, prob = "no", no_ask, no_edge, 1 - fair_yes
 
+    exit_bid = bid_for_side(snapshot, side)
+    exit_size = snapshot["yes_bid_size" if side == "yes" else "no_bid_size"]
+    horizon = min(cfg.max_hold_seconds, max(0.0, remaining - cfg.settlement_guard_seconds))
+    move = expected_move_cents(z, horizon, remaining)
+    tiers = cfg.tiers()
+    confidence = int(round(prob * 100))
+
     diagnostics = {
         "side": side,
         "ticker": market.get("ticker"),
         "price_cents": ask,
+        "exit_bid_cents": exit_bid,
+        "exit_bid_size": exit_size,
+        "spread_cents": spread,
         "edge_cents": round(edge, 2),
         "fair_prob": round(prob, 4),
         "strike": strike,
@@ -239,22 +289,40 @@ def evaluate(trades, market, orderbook):
         "spot": spot,
         "sigma_per_second": round(sigma, 8),
         "seconds_to_close": int(remaining),
+        "expected_move_cents": None if move is None else round(move, 2),
+        "scalp_targets": {
+            tier.name: min(99, ask + tier.cents) for tier in tiers
+        },
+        "stop_price_cents": max(1, ask - cfg.stop_cents),
     }
 
-    confidence = int(round(prob * 100))
-
-    if not config["min_price_cents"] <= ask <= config["max_price_cents"]:
+    if not cfg.min_price_cents <= ask <= cfg.max_price_cents:
         return _no_trade(f"Ask {ask}c is outside the tradable price band", **diagnostics)
 
-    if edge < config["min_edge_cents"]:
+    if exit_bid is None:
+        return _no_trade(f"No resting bid on {side}: could enter but not scalp out", **diagnostics)
+
+    if exit_size < cfg.min_exit_liquidity:
         return _no_trade(
-            f"Edge {edge:.1f}c below the {config['min_edge_cents']:.1f}c minimum",
+            f"Exit liquidity too thin ({exit_size} resting on the {side} bid, "
+            f"{cfg.min_exit_liquidity} required)",
             **diagnostics,
         )
 
-    if confidence < config["min_confidence"]:
+    if edge < cfg.min_edge_cents:
         return _no_trade(
-            f"Confidence {confidence}% below the {config['min_confidence']}% floor",
+            f"Edge {edge:.1f}c below the {cfg.min_edge_cents:.1f}c minimum", **diagnostics
+        )
+
+    if confidence < cfg.min_confidence:
+        return _no_trade(
+            f"Confidence {confidence}% below the {cfg.min_confidence}% floor", **diagnostics
+        )
+
+    if move is not None and move < tiers[0].cents:
+        return _no_trade(
+            f"Expected move {move:.1f}c cannot reach the {tiers[0].cents}c "
+            f"small target within {int(horizon)}s",
             **diagnostics,
         )
 
@@ -262,8 +330,9 @@ def evaluate(trades, market, orderbook):
         "action": f"BUY {side.upper()}",
         "confidence": confidence,
         "reason": (
-            f"Fair {prob * 100:.1f}% vs {ask}c ask — {edge:.1f}c edge with "
-            f"{int(remaining)}s to close"
+            f"Fair {prob * 100:.1f}% vs {ask}c ask - {edge:.1f}c edge, "
+            f"~{move:.1f}c expected travel, scalping to "
+            f"{'/'.join(str(tier.cents) for tier in tiers)}c"
         ),
     }
     payload.update(diagnostics)
