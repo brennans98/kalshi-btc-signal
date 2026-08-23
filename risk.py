@@ -4,18 +4,19 @@ Removing a human approval step does not make a system autonomous; it makes it
 unbounded. What made approval a control was that a person could refuse. These
 limits are the refusal, expressed in code and checked before every entry.
 
+Scope note: this module gates ENTRIES ONLY. Exits are never routed through
+check(). A cooldown or a daily cap that could block closing a position would
+turn a risk control into a risk, and a scalper that can open but not close is
+worse than one that does nothing.
+
 Design notes:
   - The daily loss limit is measured against the Kalshi account balance, not a
     locally accumulated tally. A local tally that misses a fill drifts toward
     understating losses, which is the direction that hurts.
   - A breached loss limit latches a halt to disk. A restart is not a reset;
     Railway restarting the container must not resume trading.
-  - These gates apply to ENTRIES only. Exits are never blocked by a cooldown,
-    a daily cap, or a halt -- a system that cannot close a position it already
-    holds is more dangerous than one that cannot open a new one.
-  - Every decision is logged, including blocked ones. Reviewing only the trades
-    that happened hides the near-misses, which is where a scalper's real
-    behaviour lives.
+  - Every decision is logged, including blocked ones. Reviewing only the
+    trades that happened hides the near-misses.
 """
 
 import json
@@ -63,12 +64,12 @@ def load_state():
     # A new UTC day resets counters and clears an automatic halt. A manual halt
     # persists until it is explicitly resumed.
     if state.get("day") != _today():
-        manual = state.get("halted") and state.get("halt_is_manual")
+        manual = bool(state.get("halted") and state.get("halt_is_manual"))
         reason = state.get("halt_reason") if manual else None
         state = _blank_state()
-        state["halted"] = bool(manual)
+        state["halted"] = manual
         state["halt_reason"] = reason
-        state["halt_is_manual"] = bool(manual)
+        state["halt_is_manual"] = manual
         save_state(state)
 
     return state
@@ -81,6 +82,10 @@ def save_state(state):
         path.write_text(json.dumps(state, indent=2))
     except Exception:
         pass
+
+
+def is_halted():
+    return bool(load_state().get("halted"))
 
 
 def log_decision(record):
@@ -132,10 +137,6 @@ def resume():
     return state
 
 
-def is_halted():
-    return bool(load_state().get("halted"))
-
-
 def note_balance(balance_cents):
     """Record the day's opening balance the first time a balance is observed."""
     if balance_cents is None:
@@ -174,55 +175,51 @@ def record_trade(ticker, count, cost_cents):
 
 
 def check(signal, balance_cents, open_position_count, open_tickers):
-    """Decide whether an ENTRY may be executed.
+    """Decide whether a new ENTRY may be executed.
 
     Returns (approved: bool, reason: str, sizing: dict|None).
     """
     cfg = config.settings
-    config_limits = limits()
     state = load_state()
 
     if state.get("halted"):
         return False, f"Trading halted: {state.get('halt_reason')}", None
 
     drawdown = drawdown_cents(balance_cents)
-    if drawdown is not None and drawdown >= config_limits["daily_loss_limit_cents"]:
+    if drawdown is not None and drawdown >= cfg.daily_loss_limit_cents:
         halt(
             f"Daily loss limit reached (down {drawdown}c of "
-            f"{config_limits['daily_loss_limit_cents']}c allowed)"
+            f"{cfg.daily_loss_limit_cents}c allowed)"
         )
         return False, "Daily loss limit reached", None
 
-    if state.get("trades_today", 0) >= config_limits["max_trades_per_day"]:
-        return False, f"Daily trade cap reached ({config_limits['max_trades_per_day']})", None
+    if state.get("trades_today", 0) >= cfg.max_trades_per_day:
+        return False, f"Daily trade cap reached ({cfg.max_trades_per_day})", None
 
-    if open_position_count >= config_limits["max_open_positions"]:
-        return False, f"Open position cap reached ({config_limits['max_open_positions']})", None
+    if open_position_count >= cfg.max_open_positions:
+        return False, f"Open position cap reached ({cfg.max_open_positions})", None
 
     ticker = signal.get("ticker")
     if ticker and ticker in (open_tickers or []):
         return False, f"Already scalping {ticker}", None
 
     elapsed = time.time() - float(state.get("last_trade_at") or 0)
-    if elapsed < config_limits["cooldown_seconds"]:
-        return False, f"Cooldown active ({int(config_limits['cooldown_seconds'] - elapsed)}s)", None
+    if elapsed < cfg.cooldown_seconds:
+        return False, f"Cooldown active ({int(cfg.cooldown_seconds - elapsed)}s remaining)", None
 
     price = int(signal.get("price_cents") or 0)
     if price <= 0:
         return False, "Signal carries no executable price", None
 
-    count = min(
-        config_limits["max_contracts_per_trade"],
-        config_limits["max_cost_per_trade_cents"] // price,
-    )
-
-    # Never size past the resting bid we intend to scalp out into.
-    exit_size = signal.get("exit_bid_size")
-    if isinstance(exit_size, int) and exit_size > 0:
-        count = min(count, exit_size)
+    count = min(cfg.max_contracts_per_trade, cfg.max_cost_per_trade_cents // price)
 
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
+
+    # Never size beyond what we could actually sell back into.
+    exit_size = signal.get("exit_bid_size")
+    if isinstance(exit_size, int) and exit_size > 0:
+        count = min(count, exit_size)
 
     if count < 1:
         return False, "Cost cap, balance, or exit liquidity allows fewer than 1 contract", None

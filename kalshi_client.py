@@ -9,6 +9,12 @@ Signing contract:
 Authentication failures raise KalshiAuthError, deliberately a different type
 from KalshiApiError, so the trading loop can halt on a bad key instead of
 retrying a request that will never succeed.
+
+Entries and exits use different time-in-force. An entry is fill-or-kill: a
+partial fill at a price the edge was not calculated against is not the trade we
+decided on. An exit is immediate-or-cancel: taking part of the way out is
+strictly better than staying fully exposed, and the ladder will re-offer the
+remainder on the next tick.
 """
 
 import base64
@@ -53,6 +59,7 @@ class KalshiClient:
         self.key_id = cfg.key_id or None
         self.order_path = cfg.order_path
         self._key_error = None
+        # Set if the venue rejects our time_in_force field, so we stop sending it.
         self._tif_unsupported = False
 
         try:
@@ -105,8 +112,8 @@ class KalshiClient:
             headers = self._sign(method, endpoint)
 
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.request(
+            async with httpx.AsyncClient(timeout=15) as http:
+                response = await http.request(
                     method.upper(),
                     f"{self.base_url}{endpoint}",
                     params=params,
@@ -144,8 +151,7 @@ class KalshiClient:
         )
 
     async def get_market(self, ticker):
-        payload = await self.request("GET", f"/markets/{ticker}", authenticate=False)
-        return payload.get("market") or payload
+        return await self.request("GET", f"/markets/{ticker}", authenticate=False)
 
     async def get_orderbook(self, ticker, depth=10):
         return await self.request(
@@ -173,29 +179,30 @@ class KalshiClient:
             params["ticker"] = ticker
         return await self.request("GET", "/portfolio/fills", params=params)
 
-    async def create_order(
-        self,
-        ticker,
-        side,
-        count,
-        price_cents,
-        client_order_id,
-        action="buy",
-        time_in_force=None,
-    ):
-        """Place a limit order.
+    # ---- orders ----
 
-        Limit, never market: a market order on a thin 15-minute book can fill
-        far from the price the edge was calculated against, which silently
-        invalidates the decision that produced it.
+    async def _place(self, body):
+        """POST an order, retrying once without time_in_force if it is rejected.
 
-        Time in force differs by direction, and the asymmetry is deliberate.
-        Entries are fill-or-kill -- a partially filled entry leaves an odd lot
-        the ladder cannot scale out of cleanly. Exits are
-        immediate-or-cancel -- when taking profit or stopping out, a partial
-        exit is strictly better than no exit, and nothing should be left
-        resting on the book unattended.
+        Kalshi has moved the order surface more than once. Rather than guess
+        which time_in_force spelling this account's endpoint accepts, drop the
+        field on the first rejection that names it and remember that for the
+        rest of the process. An exit must not fail because of an optional field.
         """
+        if self._tif_unsupported:
+            body.pop("time_in_force", None)
+
+        try:
+            return await self.request("POST", self.order_path, body=body)
+        except KalshiApiError as error:
+            message = str(error).lower()
+            if "time_in_force" in message and "time_in_force" in body:
+                self._tif_unsupported = True
+                body.pop("time_in_force", None)
+                return await self.request("POST", self.order_path, body=body)
+            raise
+
+    def _order_body(self, ticker, action, side, count, price_cents, client_order_id, tif):
         body = {
             "ticker": ticker,
             "action": action,
@@ -205,31 +212,39 @@ class KalshiClient:
             "client_order_id": client_order_id,
         }
 
+        if tif:
+            body["time_in_force"] = tif
+
+        # The price field is named for the side being traded, on both buys and
+        # sells: selling yes at 62c is yes_price=62.
         if side == "yes":
             body["yes_price"] = int(price_cents)
         else:
             body["no_price"] = int(price_cents)
 
-        if not self._tif_unsupported:
-            if time_in_force:
-                body["time_in_force"] = time_in_force
-            elif action == "buy":
-                body["time_in_force"] = "fill_or_kill"
-            else:
-                body["time_in_force"] = config.settings.exit_tif
+        return body
 
-        try:
-            return await self.request("POST", self.order_path, body=body)
-        except KalshiApiError as error:
-            # Some environments reject an unrecognised time_in_force. Retry once
-            # without it rather than failing an exit that needs to happen.
-            if "time_in_force" in str(error) and "time_in_force" in body:
-                self._tif_unsupported = True
-                body.pop("time_in_force")
-                return await self.request("POST", self.order_path, body=body)
-            raise
+    async def create_order(
+        self, ticker, side, count, price_cents, client_order_id, action="buy"
+    ):
+        """Place a limit order.
+
+        Limit, not market: a market order on a thin 15-minute book can fill far
+        from the price the edge was calculated against, which would silently
+        invalidate the decision that produced it.
+        """
+        tif = "fill_or_kill" if action == "buy" else config.settings.exit_tif
+        body = self._order_body(
+            ticker, action, side, count, price_cents, client_order_id, tif
+        )
+        return await self._place(body)
 
     async def sell(self, ticker, side, count, price_cents, client_order_id):
+        """Exit `count` contracts of `side` at a limit price.
+
+        Uses immediate-or-cancel rather than fill-or-kill: a partial exit is
+        better than no exit, and the ladder re-offers the remainder next tick.
+        """
         return await self.create_order(
             ticker=ticker,
             side=side,
