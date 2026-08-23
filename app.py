@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import time
 from collections import deque
 from pathlib import Path
@@ -10,8 +9,10 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import config
 import policy
 import risk
+import scalp
 import trader
 from kalshi_client import KalshiClient
 
@@ -21,29 +22,23 @@ STATIC_DIR = BASE_DIR / "static"
 COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_PRODUCT = "BTC-USD"
 
-KALSHI_SERIES_TICKER = os.getenv("KALSHI_SERIES_TICKER", "KXBTC15M")
-LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SECONDS", "5"))
-
 trades = deque(maxlen=20000)
-client = KalshiClient()
+books = {}
 
 state = {
     "spot_connected": False,
     "spot_error": None,
     "kalshi_status": "Starting market discovery",
     "kalshi_error": None,
-    "kalshi_market_ticker": None,
-    "kalshi_market_title": None,
-    "kalshi_close_time": None,
-    "kalshi_checked_at": None,
     "market": None,
-    "orderbook": None,
-    "orderbook_at": None,
-    "orderbook_error": None,
+    "kalshi_checked_at": None,
+    "book_error": None,
+    "book_updated_at": None,
 }
 
-app = FastAPI(title="BTC Signal Dashboard")
+app = FastAPI(title="BTC 15m Scalper")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+client = KalshiClient()
 
 
 def pct_move(seconds_ago):
@@ -65,11 +60,24 @@ def pct_move(seconds_ago):
     return ((trades[-1][1] - earlier) / earlier) * 100
 
 
+def current_market():
+    return state.get("market")
+
+
+def current_book(ticker=None):
+    market = current_market()
+    ticker = ticker or (market or {}).get("ticker")
+    return books.get(ticker) if ticker else None
+
+
 def signal():
-    return policy.evaluate(trades, state["market"], state["orderbook"])
+    return policy.evaluate(trades, current_market(), current_book())
 
 
 def api_payload():
+    market = current_market() or {}
+    book = policy.book_snapshot(current_book())
+
     return {
         "signal": signal(),
         "btc_usd": trades[-1][1] if trades else None,
@@ -80,15 +88,17 @@ def api_payload():
         "kalshi": {
             "status": state["kalshi_status"],
             "error": state["kalshi_error"],
-            "series_ticker": KALSHI_SERIES_TICKER,
-            "market_ticker": state["kalshi_market_ticker"],
-            "market_title": state["kalshi_market_title"],
-            "close_time": state["kalshi_close_time"],
+            "series_ticker": config.settings.series_ticker,
+            "market_ticker": market.get("ticker"),
+            "market_title": market.get("title"),
+            "close_time": market.get("close_time"),
             "checked_at": state["kalshi_checked_at"],
-            "orderbook_at": state["orderbook_at"],
-            "orderbook_error": state["orderbook_error"],
+            "book": book,
+            "book_error": state["book_error"],
+            "book_updated_at": state["book_updated_at"],
         },
-        "execution": trader.snapshot(),
+        "trader": trader.snapshot(),
+        "config": config.settings.public_view(),
         "updated_at": int(time.time()),
     }
 
@@ -127,42 +137,46 @@ async def coinbase_worker():
 
 
 def choose_market(markets):
-    open_markets = [
-        market for market in markets
-        if market.get("status") == "active" and market.get("ticker")
-    ]
+    """The soonest-closing market that still has enough runway to scalp.
 
-    if not open_markets:
+    Picking the very soonest close would keep selecting markets inside the
+    settlement guard, which the policy then rejects every tick.
+    """
+    cfg = config.settings
+    candidates = []
+
+    for market in markets:
+        if market.get("status") not in ("active", "open") or not market.get("ticker"):
+            continue
+
+        remaining = policy.seconds_to_close(market)
+        if remaining is None or remaining < cfg.min_seconds_to_close:
+            continue
+
+        candidates.append((remaining, market))
+
+    if not candidates:
         return None
 
-    open_markets.sort(
-        key=lambda market: market.get("close_time", "9999-12-31T23:59:59Z")
-    )
-    return open_markets[0]
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 async def kalshi_market_discovery_worker():
     while True:
         try:
-            payload = await client.get_markets(KALSHI_SERIES_TICKER)
+            payload = await client.get_markets(config.settings.series_ticker)
             market = choose_market(payload.get("markets", []))
-
             state["kalshi_checked_at"] = int(time.time())
 
             if market is None:
-                state["kalshi_status"] = "No open BTC-15m market found"
+                state["kalshi_status"] = "No scalpable BTC-15m market in the window"
                 state["kalshi_error"] = None
                 state["market"] = None
-                state["kalshi_market_ticker"] = None
-                state["kalshi_market_title"] = None
-                state["kalshi_close_time"] = None
             else:
                 state["kalshi_status"] = "Current market discovered"
                 state["kalshi_error"] = None
                 state["market"] = market
-                state["kalshi_market_ticker"] = market.get("ticker")
-                state["kalshi_market_title"] = market.get("title")
-                state["kalshi_close_time"] = market.get("close_time")
 
         except Exception as error:
             state["kalshi_status"] = "Market discovery error"
@@ -172,39 +186,56 @@ async def kalshi_market_discovery_worker():
 
 
 async def orderbook_worker():
-    """Poll the active market's book. Without this the model has no ask to price against."""
+    """Poll the book for the active market and for anything still held.
+
+    Open lots are included because the exit ladder needs a live bid for every
+    position, including one whose market is no longer the entry candidate.
+    """
     while True:
-        ticker = state.get("kalshi_market_ticker")
-
-        if not ticker:
-            state["orderbook"] = None
-            await asyncio.sleep(2)
-            continue
-
         try:
-            state["orderbook"] = await client.get_orderbook(ticker)
-            state["orderbook_at"] = int(time.time())
-            state["orderbook_error"] = None
-        except Exception as error:
-            state["orderbook_error"] = str(error)[:180]
+            tickers = []
+            market = current_market()
+            if market and market.get("ticker"):
+                tickers.append(market["ticker"])
 
-        await asyncio.sleep(2)
+            mode = trader.mode()
+            for lot in scalp.open_lots(mode if mode != "off" else "dryrun"):
+                if lot["ticker"] not in tickers:
+                    tickers.append(lot["ticker"])
+
+            for ticker in tickers:
+                books[ticker] = await client.get_orderbook(ticker)
+
+            for stale in [key for key in books if key not in tickers]:
+                books.pop(stale, None)
+
+            state["book_error"] = None
+            state["book_updated_at"] = int(time.time())
+
+        except Exception as error:
+            state["book_error"] = str(error)[:180]
+
+        await asyncio.sleep(config.settings.book_poll_seconds)
 
 
 @app.on_event("startup")
 async def startup():
+    Path(config.settings.data_dir).mkdir(parents=True, exist_ok=True)
+
     asyncio.create_task(coinbase_worker())
     asyncio.create_task(kalshi_market_discovery_worker())
     asyncio.create_task(orderbook_worker())
-    asyncio.create_task(trader.loop(client, signal, interval=LOOP_INTERVAL))
+
+    if config.settings.is_enabled:
+        asyncio.create_task(
+            trader.loop(client, signal, current_market, current_book)
+        )
 
 
 def require_admin(token):
-    expected = os.getenv("ADMIN_TOKEN", "").strip()
-
+    expected = config.settings.admin_token
     if not expected:
         raise HTTPException(503, "ADMIN_TOKEN is not configured")
-
     if token != expected:
         raise HTTPException(401, "Invalid admin token")
 
@@ -221,38 +252,83 @@ async def api_state():
 
 @app.get("/api/decisions")
 async def api_decisions(limit: int = 50):
-    return {"decisions": risk.read_decisions(limit=limit)}
+    return {"decisions": risk.read_decisions(min(limit, 200))}
 
 
-@app.get("/health")
-async def health():
-    execution = trader.snapshot()
-    return {
-        "ok": True,
-        "spot_connected": state["spot_connected"],
-        "kalshi_status": state["kalshi_status"],
-        "trading_mode": execution["mode"],
-        "loop_running": execution["running"],
-        "halted": execution["halted"],
-    }
+@app.get("/api/scalp")
+async def api_scalp():
+    mode = trader.mode()
+    return scalp.view(mode if mode != "off" else "dryrun")
 
 
-@app.post("/admin/selftest")
-async def admin_selftest(x_admin_token: str = Header(default="")):
+@app.get("/api/trader/selftest")
+async def api_selftest(x_admin_token: str = Header(None)):
     require_admin(x_admin_token)
     return await client.selftest()
 
 
-@app.post("/admin/halt")
-async def admin_halt(x_admin_token: str = Header(default="")):
+@app.post("/api/trader/halt")
+async def api_halt(x_admin_token: str = Header(None)):
     require_admin(x_admin_token)
     return risk.halt("Manual halt via admin endpoint", manual=True)
 
 
-@app.post("/admin/resume")
-async def admin_resume(x_admin_token: str = Header(default="")):
+@app.post("/api/trader/resume")
+async def api_resume(x_admin_token: str = Header(None)):
     require_admin(x_admin_token)
     return risk.resume()
+
+
+@app.post("/api/trader/flatten")
+async def api_flatten(x_admin_token: str = Header(None)):
+    """Halt entries and exit every open lot at the current bid."""
+    require_admin(x_admin_token)
+    risk.halt("Manual flatten via admin endpoint", manual=True)
+
+    mode = trader.mode()
+    for lot in scalp.open_lots(mode if mode != "off" else "dryrun"):
+        snapshot = policy.book_snapshot(current_book(lot["ticker"]))
+        bid = policy.bid_for_side(snapshot, lot["side"])
+        if bid is None:
+            continue
+
+        if mode == "live":
+            try:
+                await client.sell(
+                    ticker=lot["ticker"],
+                    side=lot["side"],
+                    count=lot["count_open"],
+                    price_cents=max(1, int(bid)),
+                    client_order_id=f"flatten-{int(time.time())}",
+                )
+            except Exception as error:
+                risk.log_decision(
+                    {"event": "flatten", "ticker": lot["ticker"], "error": str(error)}
+                )
+                continue
+
+        scalp.record_exit(
+            mode if mode != "off" else "dryrun",
+            lot["key"],
+            "manual",
+            "time",
+            lot["count_open"],
+            int(bid),
+        )
+
+    return {"flattened": True, "scalp": scalp.view(mode if mode != "off" else "dryrun")}
+
+
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "spot_connected": state["spot_connected"],
+        "kalshi_status": state["kalshi_status"],
+        "trading_mode": config.settings.trading_mode,
+        "trader_running": trader.status["running"],
+        "halted": risk.is_halted(),
+    }
 
 
 @app.get("/manifest.webmanifest")
