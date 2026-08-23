@@ -5,15 +5,15 @@ import time
 from collections import deque
 from pathlib import Path
 
-import httpx
 import websockets
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import policy
+import risk
+import trader
 from kalshi_client import KalshiClient
-from trader import Trader
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -21,11 +21,11 @@ STATIC_DIR = BASE_DIR / "static"
 COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
 COINBASE_PRODUCT = "BTC-USD"
 
-KALSHI_PUBLIC_API = os.getenv("KALSHI_PUBLIC_API", "https://external-api.kalshi.com/trade-api/v2")
 KALSHI_SERIES_TICKER = os.getenv("KALSHI_SERIES_TICKER", "KXBTC15M")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+LOOP_INTERVAL = float(os.getenv("LOOP_INTERVAL_SECONDS", "5"))
 
 trades = deque(maxlen=20000)
+client = KalshiClient()
 
 state = {
     "spot_connected": False,
@@ -36,38 +36,14 @@ state = {
     "kalshi_market_title": None,
     "kalshi_close_time": None,
     "kalshi_checked_at": None,
+    "market": None,
     "orderbook": None,
-    "orderbook_error": None,
     "orderbook_at": None,
+    "orderbook_error": None,
 }
 
 app = FastAPI(title="BTC Signal Dashboard")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-def current_market():
-    if not state["kalshi_market_ticker"]:
-        return None
-    return {
-        "ticker": state["kalshi_market_ticker"],
-        "title": state["kalshi_market_title"],
-        "close_time": state["kalshi_close_time"],
-    }
-
-
-def trader_context():
-    spot = trades[-1][1] if trades else None
-    return spot, list(trades), current_market(), state["orderbook"]
-
-
-trader = Trader(trader_context)
-
-
-def require_admin(token):
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid admin token")
 
 
 def pct_move(seconds_ago):
@@ -90,14 +66,7 @@ def pct_move(seconds_ago):
 
 
 def signal():
-    if not trades:
-        return policy.no_trade("Waiting for live BTC-USD trades")
-
-    if time.time() - trades[-1][0] > 5:
-        return policy.no_trade("Coinbase BTC feed is stale")
-
-    spot, tape, market, orderbook = trader_context()
-    return policy.evaluate(spot, tape, market, orderbook)
+    return policy.evaluate(trades, state["market"], state["orderbook"])
 
 
 def api_payload():
@@ -116,11 +85,10 @@ def api_payload():
             "market_title": state["kalshi_market_title"],
             "close_time": state["kalshi_close_time"],
             "checked_at": state["kalshi_checked_at"],
-            "book": policy.best_levels(state["orderbook"]) if state["orderbook"] else None,
-            "book_error": state["orderbook_error"],
-            "book_at": state["orderbook_at"],
+            "orderbook_at": state["orderbook_at"],
+            "orderbook_error": state["orderbook_error"],
         },
-        "trader": trader.snapshot(),
+        "execution": trader.snapshot(),
         "updated_at": int(time.time()),
     }
 
@@ -176,40 +144,25 @@ def choose_market(markets):
 async def kalshi_market_discovery_worker():
     while True:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.get(
-                    f"{KALSHI_PUBLIC_API}/markets",
-                    params={
-                        "series_ticker": KALSHI_SERIES_TICKER,
-                        "status": "open",
-                        "limit": 100,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-
-            markets = payload.get("markets", [])
-            market = choose_market(markets)
+            payload = await client.get_markets(KALSHI_SERIES_TICKER)
+            market = choose_market(payload.get("markets", []))
 
             state["kalshi_checked_at"] = int(time.time())
 
             if market is None:
                 state["kalshi_status"] = "No open BTC-15m market found"
                 state["kalshi_error"] = None
+                state["market"] = None
                 state["kalshi_market_ticker"] = None
                 state["kalshi_market_title"] = None
                 state["kalshi_close_time"] = None
             else:
-                previous = state["kalshi_market_ticker"]
                 state["kalshi_status"] = "Current market discovered"
                 state["kalshi_error"] = None
+                state["market"] = market
                 state["kalshi_market_ticker"] = market.get("ticker")
                 state["kalshi_market_title"] = market.get("title")
                 state["kalshi_close_time"] = market.get("close_time")
-
-                if previous != state["kalshi_market_ticker"]:
-                    state["orderbook"] = None
-                    state["orderbook_at"] = None
 
         except Exception as error:
             state["kalshi_status"] = "Market discovery error"
@@ -219,31 +172,19 @@ async def kalshi_market_discovery_worker():
 
 
 async def orderbook_worker():
-    """Poll the book for the active market. This is what was missing before."""
-    public_client = KalshiClient()
-
+    """Poll the active market's book. Without this the model has no ask to price against."""
     while True:
-        ticker = state["kalshi_market_ticker"]
+        ticker = state.get("kalshi_market_ticker")
 
         if not ticker:
+            state["orderbook"] = None
             await asyncio.sleep(2)
             continue
 
         try:
-            if public_client.configured:
-                book = await public_client.get_orderbook(ticker)
-            else:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    response = await client.get(
-                        f"{KALSHI_PUBLIC_API}/markets/{ticker}/orderbook",
-                        params={"depth": 8},
-                    )
-                    response.raise_for_status()
-                    book = response.json()
-
-            state["orderbook"] = book
-            state["orderbook_error"] = None
+            state["orderbook"] = await client.get_orderbook(ticker)
             state["orderbook_at"] = int(time.time())
+            state["orderbook_error"] = None
         except Exception as error:
             state["orderbook_error"] = str(error)[:180]
 
@@ -255,7 +196,17 @@ async def startup():
     asyncio.create_task(coinbase_worker())
     asyncio.create_task(kalshi_market_discovery_worker())
     asyncio.create_task(orderbook_worker())
-    asyncio.create_task(trader.run())
+    asyncio.create_task(trader.loop(client, signal, interval=LOOP_INTERVAL))
+
+
+def require_admin(token):
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+
+    if not expected:
+        raise HTTPException(503, "ADMIN_TOKEN is not configured")
+
+    if token != expected:
+        raise HTTPException(401, "Invalid admin token")
 
 
 @app.get("/")
@@ -268,41 +219,40 @@ async def api_state():
     return api_payload()
 
 
-@app.get("/api/trader")
-async def api_trader():
-    return trader.snapshot()
-
-
-@app.get("/api/trader/selftest")
-async def api_selftest(x_admin_token: str = Header(default="")):
-    """Verify credentials and signing without placing an order."""
-    require_admin(x_admin_token)
-    return await trader.client.selftest()
-
-
-@app.post("/api/trader/halt")
-async def api_halt(x_admin_token: str = Header(default="")):
-    require_admin(x_admin_token)
-    trader.risk.halt("manual halt via admin endpoint")
-    return trader.risk.snapshot()
-
-
-@app.post("/api/trader/resume")
-async def api_resume(x_admin_token: str = Header(default="")):
-    require_admin(x_admin_token)
-    trader.risk.resume()
-    return trader.risk.snapshot()
+@app.get("/api/decisions")
+async def api_decisions(limit: int = 50):
+    return {"decisions": risk.read_decisions(limit=limit)}
 
 
 @app.get("/health")
 async def health():
+    execution = trader.snapshot()
     return {
         "ok": True,
         "spot_connected": state["spot_connected"],
         "kalshi_status": state["kalshi_status"],
-        "trading_mode": trader.mode,
-        "halted": trader.risk.state.get("halted", False),
+        "trading_mode": execution["mode"],
+        "loop_running": execution["running"],
+        "halted": execution["halted"],
     }
+
+
+@app.post("/admin/selftest")
+async def admin_selftest(x_admin_token: str = Header(default="")):
+    require_admin(x_admin_token)
+    return await client.selftest()
+
+
+@app.post("/admin/halt")
+async def admin_halt(x_admin_token: str = Header(default="")):
+    require_admin(x_admin_token)
+    return risk.halt("Manual halt via admin endpoint", manual=True)
+
+
+@app.post("/admin/resume")
+async def admin_resume(x_admin_token: str = Header(default="")):
+    require_admin(x_admin_token)
+    return risk.resume()
 
 
 @app.get("/manifest.webmanifest")

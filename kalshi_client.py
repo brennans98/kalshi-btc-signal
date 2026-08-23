@@ -1,12 +1,14 @@
 """Authenticated Kalshi trade-api v2 client.
 
-Signing contract (Kalshi trade-api v2):
-    message   = timestamp_ms + HTTP_METHOD + path
-    path      includes the /trade-api/v2 prefix and EXCLUDES any query string
-    signature = RSA-PSS over SHA256, salt length = digest length, base64
+Signing contract:
+    message   = f"{timestamp_ms}{METHOD}{path}"
+    path      includes the "/trade-api/v2" prefix and EXCLUDES any query string
+    signature = base64(RSA-PSS(SHA256, salt_length=DIGEST_LENGTH)) over message
+    headers   KALSHI-ACCESS-KEY / KALSHI-ACCESS-SIGNATURE / KALSHI-ACCESS-TIMESTAMP
 
-Headers sent on every authenticated request:
-    KALSHI-ACCESS-KEY, KALSHI-ACCESS-TIMESTAMP, KALSHI-ACCESS-SIGNATURE
+Authentication failures raise KalshiAuthError, which is deliberately a
+different type from KalshiApiError so the trading loop can halt on a bad
+key instead of retrying a request that will never succeed.
 """
 
 import base64
@@ -18,73 +20,78 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 
 
-class KalshiAuthError(Exception):
-    """Credentials are missing, malformed, or rejected. Never retried blindly."""
+class KalshiAuthError(RuntimeError):
+    """Credentials are missing, malformed, or rejected. Not retryable."""
 
 
-class KalshiRequestError(Exception):
-    """Transport or non-auth API error."""
+class KalshiApiError(RuntimeError):
+    """Transport or API error. May be transient."""
+
+
+def _load_private_key(raw):
+    if not raw:
+        return None
+
+    # Railway variables commonly arrive with literal backslash-n sequences.
+    pem = raw.replace("\\n", "\n").strip()
+
+    try:
+        return serialization.load_pem_private_key(
+            pem.encode("utf-8"),
+            password=None,
+        )
+    except Exception as error:
+        raise KalshiAuthError(
+            f"KALSHI_PRIVATE_KEY could not be parsed as a PEM private key: {error}"
+        )
+
+
+def environment():
+    return "prod" if os.getenv("KALSHI_ENV", "demo").lower() == "prod" else "demo"
+
+
+def base_url():
+    return PROD_BASE if environment() == "prod" else DEMO_BASE
 
 
 class KalshiClient:
-    def __init__(self, key_id=None, private_key_pem=None, env=None, timeout=10.0):
-        self.key_id = (key_id if key_id is not None else os.getenv("KALSHI_KEY_ID", "")).strip()
-        self.env = (env if env is not None else os.getenv("KALSHI_ENV", "demo")).strip().lower()
-        self.base_url = PROD_BASE if self.env in ("prod", "production", "live") else DEMO_BASE
+    def __init__(self):
+        self.base_url = base_url()
+        self.environment = environment()
+        self.key_id = os.getenv("KALSHI_API_KEY_ID", "").strip() or None
         self.order_path = os.getenv("KALSHI_ORDER_PATH", "/portfolio/orders")
-        self.timeout = timeout
-        self._pem = self._normalize_pem(
-            private_key_pem if private_key_pem is not None else os.getenv("KALSHI_PRIVATE_KEY", "")
-        )
-        self._private_key = None
+        self._key_error = None
 
-    # ---------- credentials ----------
-
-    @staticmethod
-    def _normalize_pem(raw):
-        """Accept PEM pasted with real newlines or with literal backslash-n."""
-        if not raw:
-            return ""
-        text = raw.strip().strip('"').strip("'")
-        if "\\n" in text and "\n" not in text:
-            text = text.replace("\\n", "\n")
-        return text.strip()
+        try:
+            self.private_key = _load_private_key(os.getenv("KALSHI_PRIVATE_KEY"))
+        except KalshiAuthError as error:
+            self.private_key = None
+            self._key_error = str(error)
 
     @property
-    def configured(self):
-        return bool(self.key_id) and bool(self._pem)
+    def has_credentials(self):
+        return bool(self.key_id and self.private_key)
 
     @property
-    def is_production(self):
-        return self.base_url == PROD_BASE
-
-    def _key(self):
-        if self._private_key is None:
-            if not self._pem:
-                raise KalshiAuthError("KALSHI_PRIVATE_KEY is not set")
-            if "PRIVATE KEY" not in self._pem:
-                raise KalshiAuthError("KALSHI_PRIVATE_KEY does not look like a PEM private key")
-            try:
-                self._private_key = serialization.load_pem_private_key(
-                    self._pem.encode("utf-8"), password=None
-                )
-            except Exception as error:
-                raise KalshiAuthError(f"private key could not be parsed: {error}")
-        return self._private_key
-
-    def _auth_headers(self, method, path):
+    def credential_error(self):
+        if self._key_error:
+            return self._key_error
         if not self.key_id:
-            raise KalshiAuthError("KALSHI_KEY_ID is not set")
+            return "KALSHI_API_KEY_ID is not set"
+        if not self.private_key:
+            return "KALSHI_PRIVATE_KEY is not set"
+        return None
 
+    def _sign(self, method, endpoint):
         timestamp = str(int(time.time() * 1000))
-        sign_path = urlparse(self.base_url + path).path
-        message = f"{timestamp}{method.upper()}{sign_path}".encode("utf-8")
+        path = urlparse(self.base_url).path + endpoint.split("?")[0]
+        message = f"{timestamp}{method.upper()}{path}".encode("utf-8")
 
-        signature = self._key().sign(
+        signature = self.private_key.sign(
             message,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
@@ -95,123 +102,137 @@ class KalshiClient:
 
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
             "Content-Type": "application/json",
-            "Accept": "application/json",
         }
 
-    # ---------- transport ----------
+    async def request(self, method, endpoint, params=None, body=None, authenticate=True):
+        headers = {"Content-Type": "application/json"}
 
-    async def _request(self, method, path, params=None, json_body=None, authenticated=True):
-        headers = self._auth_headers(method, path) if authenticated else {"Accept": "application/json"}
+        if authenticate:
+            if not self.has_credentials:
+                raise KalshiAuthError(self.credential_error)
+            headers = self._sign(method, endpoint)
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=15) as client:
                 response = await client.request(
                     method.upper(),
-                    self.base_url + path,
+                    f"{self.base_url}{endpoint}",
                     params=params,
-                    json=json_body,
+                    json=body,
                     headers=headers,
                 )
         except Exception as error:
-            raise KalshiRequestError(f"{method.upper()} {path} transport failure: {error}")
+            raise KalshiApiError(f"{method.upper()} {endpoint} transport error: {error}")
 
         if response.status_code in (401, 403):
             raise KalshiAuthError(
-                f"{method.upper()} {path} rejected ({response.status_code}): {response.text[:300]}"
+                f"{method.upper()} {endpoint} rejected ({response.status_code}): "
+                f"{response.text[:200]}"
             )
 
         if response.status_code >= 400:
-            raise KalshiRequestError(
-                f"{method.upper()} {path} failed ({response.status_code}): {response.text[:300]}"
+            raise KalshiApiError(
+                f"{method.upper()} {endpoint} failed ({response.status_code}): "
+                f"{response.text[:200]}"
             )
 
         if not response.content:
             return {}
 
-        try:
-            return response.json()
-        except Exception as error:
-            raise KalshiRequestError(f"{method.upper()} {path} returned non-JSON: {error}")
+        return response.json()
 
-    # ---------- reads ----------
+    # ---- market data (public) ----
 
-    async def get_orderbook(self, ticker, depth=8):
-        return await self._request(
+    async def get_markets(self, series_ticker, status="open", limit=100):
+        return await self.request(
+            "GET",
+            "/markets",
+            params={"series_ticker": series_ticker, "status": status, "limit": limit},
+            authenticate=False,
+        )
+
+    async def get_orderbook(self, ticker, depth=10):
+        return await self.request(
             "GET",
             f"/markets/{ticker}/orderbook",
             params={"depth": depth},
+            authenticate=False,
         )
 
+    # ---- portfolio (authenticated) ----
+
     async def get_balance(self):
-        return await self._request("GET", "/portfolio/balance")
+        return await self.request("GET", "/portfolio/balance")
 
-    async def get_positions(self, ticker=None):
-        params = {"limit": 200, "count_filter": "position"}
-        if ticker:
-            params["ticker"] = ticker
-        return await self._request("GET", "/portfolio/positions", params=params)
+    async def get_positions(self):
+        return await self.request(
+            "GET",
+            "/portfolio/positions",
+            params={"settlement_status": "unsettled", "limit": 200},
+        )
 
-    async def get_fills(self, ticker=None, limit=100):
+    async def get_fills(self, ticker=None, limit=50):
         params = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
-        return await self._request("GET", "/portfolio/fills", params=params)
+        return await self.request("GET", "/portfolio/fills", params=params)
 
-    # ---------- write ----------
+    async def create_order(self, ticker, side, count, price_cents, client_order_id):
+        """Buy `count` contracts of `side` ('yes'/'no') as a limit order.
 
-    async def create_order(self, ticker, action, side, count, limit_price_cents, client_order_id,
-                           order_type="limit", time_in_force=None):
-        """Place an order. limit_price_cents is the price for `side` in cents (1-99)."""
+        Limit, not market: a market order on a thin 15-minute book can fill far
+        from the price the edge was calculated against, which would silently
+        invalidate the decision that produced it.
+        """
         body = {
             "ticker": ticker,
-            "action": action,          # "buy" | "sell"
-            "side": side,              # "yes" | "no"
+            "action": "buy",
+            "side": side,
             "count": int(count),
-            "type": order_type,
+            "type": "limit",
             "client_order_id": client_order_id,
+            "time_in_force": "fill_or_kill",
         }
 
-        if order_type == "limit":
-            if side == "yes":
-                body["yes_price"] = int(limit_price_cents)
-            else:
-                body["no_price"] = int(limit_price_cents)
+        if side == "yes":
+            body["yes_price"] = int(price_cents)
+        else:
+            body["no_price"] = int(price_cents)
 
-        if time_in_force:
-            body["time_in_force"] = time_in_force
-
-        return await self._request("POST", self.order_path, json_body=body)
-
-    # ---------- diagnostics ----------
+        return await self.request("POST", self.order_path, body=body)
 
     async def selftest(self):
-        """Verify signing end to end without placing an order."""
+        """Verify signing and read-only portfolio access without placing an order."""
         result = {
-            "env": self.env,
+            "environment": self.environment,
             "base_url": self.base_url,
-            "key_id_present": bool(self.key_id),
-            "private_key_present": bool(self._pem),
-            "signing_ok": False,
-            "balance_ok": False,
-            "balance_cents": None,
-            "error": None,
+            "order_path": self.order_path,
+            "has_credentials": self.has_credentials,
         }
 
-        try:
-            self._auth_headers("GET", "/portfolio/balance")
-            result["signing_ok"] = True
-        except Exception as error:
-            result["error"] = str(error)[:300]
+        if not self.has_credentials:
+            result["ok"] = False
+            result["error"] = self.credential_error
             return result
 
         try:
             balance = await self.get_balance()
-            result["balance_ok"] = True
-            result["balance_cents"] = balance.get("balance")
-        except Exception as error:
-            result["error"] = str(error)[:300]
+            positions = await self.get_positions()
+        except KalshiAuthError as error:
+            result["ok"] = False
+            result["error_type"] = "auth"
+            result["error"] = str(error)
+            return result
+        except KalshiApiError as error:
+            result["ok"] = False
+            result["error_type"] = "api"
+            result["error"] = str(error)
+            return result
 
+        result["ok"] = True
+        result["balance_cents"] = balance.get("balance")
+        result["open_position_count"] = len(positions.get("market_positions", []))
         return result

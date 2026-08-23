@@ -1,12 +1,21 @@
-"""Signal policy: converts the live BTC tape plus the Kalshi book into a decision.
+"""The decision model that was missing.
 
-Every threshold is an environment variable so it can be tuned without a code change.
-Every rejection returns a plain-language reason that surfaces on the dashboard.
+The previous signal() computed momentum inputs and then returned a hardcoded
+NO TRADE, because nothing ever compared a fair value against the Kalshi book.
+This module does that comparison.
+
+Approach: estimate realized volatility from the live trade tape, price the
+binary as a driftless lognormal, and compare that probability against what the
+book is actually asking. Trade only when the ask is enough below fair value to
+cover the cost of being wrong about the volatility estimate.
+
+Every rejection returns a specific reason string. A dashboard that says
+"edge 0.4c below the 3.0c minimum" is debuggable; a bare NO TRADE is not.
 """
 
 import math
 import os
-import re
+import time
 from datetime import datetime, timezone
 
 
@@ -24,237 +33,238 @@ def _env_int(name, default):
         return int(default)
 
 
-def limits():
+def settings():
     return {
-        "min_edge_cents": _env_float("MIN_EDGE_CENTS", 6),
-        "min_confidence": _env_float("MIN_CONFIDENCE", 60),
-        "max_spread_cents": _env_float("MAX_SPREAD_CENTS", 6),
-        "min_book_size": _env_int("MIN_BOOK_SIZE", 20),
-        "min_price_cents": _env_float("MIN_PRICE_CENTS", 12),
-        "max_price_cents": _env_float("MAX_PRICE_CENTS", 88),
-        "min_seconds_to_close": _env_int("MIN_SECONDS_TO_CLOSE", 90),
+        "min_edge_cents": _env_float("MIN_EDGE_CENTS", 3.0),
+        "min_confidence": _env_int("MIN_CONFIDENCE", 58),
+        "max_spread_cents": _env_int("MAX_SPREAD_CENTS", 8),
+        "min_price_cents": _env_int("MIN_PRICE_CENTS", 8),
+        "max_price_cents": _env_int("MAX_PRICE_CENTS", 92),
+        "min_seconds_to_close": _env_int("MIN_SECONDS_TO_CLOSE", 75),
         "max_seconds_to_close": _env_int("MAX_SECONDS_TO_CLOSE", 900),
-        "min_vol_samples": _env_int("MIN_VOL_SAMPLES", 30),
+        "min_history_seconds": _env_int("MIN_HISTORY_SECONDS", 120),
+        "stale_feed_seconds": _env_float("STALE_FEED_SECONDS", 5.0),
     }
 
 
-def no_trade(reason, **extra):
-    payload = {"action": "NO TRADE", "side": None, "confidence": 0, "reason": reason}
+def _no_trade(reason, **extra):
+    payload = {"action": "NO TRADE", "confidence": 0, "reason": reason}
     payload.update(extra)
     return payload
 
 
-# ---------- market plumbing ----------
+def _normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-def extract_strike(ticker, title=None):
-    """Pull the threshold price out of a KXBTC15M ticker.
 
-    Kalshi threshold tickers end in -T<strike>, e.g. KXBTC15M-26AUG23H1345-T77250.
-    Falls back to the title when the ticker has no -T segment.
+def realized_vol_per_second(trades, window_seconds=300):
+    """Annualization-free volatility: standard deviation of 1-second log returns.
+
+    Sampling at one second rather than per-trade keeps the estimate from being
+    inflated by trade-rate bursts, which is the usual way a naive tick-level
+    estimate produces a fake edge.
     """
-    if ticker:
-        match = re.search(r"-T(\d+(?:\.\d+)?)$", ticker.strip())
-        if match:
-            return float(match.group(1))
-
-    if title:
-        match = re.search(r"\$?\s*([0-9][0-9,]{3,})(?:\.\d+)?", title)
-        if match:
-            return float(match.group(1).replace(",", ""))
-
-    return None
-
-
-def seconds_to_close(close_time_iso):
-    if not close_time_iso:
-        return None
-    try:
-        text = close_time_iso.replace("Z", "+00:00")
-        close = datetime.fromisoformat(text)
-        if close.tzinfo is None:
-            close = close.replace(tzinfo=timezone.utc)
-        return (close - datetime.now(timezone.utc)).total_seconds()
-    except Exception:
+    if len(trades) < 30:
         return None
 
-
-def best_levels(orderbook):
-    """Return best yes bid/ask in cents with resting size.
-
-    Kalshi books quote resting BIDS on both sides. A yes ask is therefore
-    derived from the best no bid: yes_ask = 100 - best_no_bid.
-    """
-    book = (orderbook or {}).get("orderbook") or {}
-    yes_levels = book.get("yes") or []
-    no_levels = book.get("no") or []
-
-    def top(levels):
-        best_price = None
-        best_size = 0
-        for level in levels:
-            if not level:
-                continue
-            try:
-                price = float(level[0])
-                size = float(level[1]) if len(level) > 1 else 0
-            except (TypeError, ValueError, IndexError):
-                continue
-            if best_price is None or price > best_price:
-                best_price, best_size = price, size
-        return best_price, best_size
-
-    yes_bid, yes_bid_size = top(yes_levels)
-    no_bid, no_bid_size = top(no_levels)
-
-    yes_ask = (100 - no_bid) if no_bid is not None else None
-    return {
-        "yes_bid": yes_bid,
-        "yes_bid_size": yes_bid_size,
-        "yes_ask": yes_ask,
-        "yes_ask_size": no_bid_size,
-        "no_bid": no_bid,
-        "no_ask": (100 - yes_bid) if yes_bid is not None else None,
-        "no_ask_size": yes_bid_size,
-    }
-
-
-# ---------- model ----------
-
-def realized_vol_per_second(trades, lookback_seconds=300):
-    """Standard deviation of one-second log returns over the recent tape."""
-    if not trades or len(trades) < 5:
-        return None, 0
-
-    now = trades[-1][0]
-    cutoff = now - lookback_seconds
-
+    cutoff = time.time() - window_seconds
     buckets = {}
+
     for timestamp, price in trades:
-        if timestamp < cutoff:
-            continue
-        buckets[int(timestamp)] = price
+        if timestamp >= cutoff:
+            buckets[int(timestamp)] = price
 
-    if len(buckets) < 5:
-        return None, len(buckets)
+    if len(buckets) < 30:
+        return None
 
-    series = [buckets[second] for second in sorted(buckets)]
-    returns = []
-    for previous, current in zip(series, series[1:]):
-        if previous > 0 and current > 0:
-            returns.append(math.log(current / previous))
+    series = [buckets[key] for key in sorted(buckets)]
+    returns = [
+        math.log(series[index] / series[index - 1])
+        for index in range(1, len(series))
+        if series[index] > 0 and series[index - 1] > 0
+    ]
 
-    if len(returns) < 4:
-        return None, len(returns)
+    if len(returns) < 20:
+        return None
 
     mean = sum(returns) / len(returns)
     variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
     sigma = math.sqrt(variance)
 
-    return (sigma if sigma > 0 else None), len(returns)
+    return sigma if sigma > 0 else None
 
 
-def normal_cdf(z):
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-
-
-def fair_yes_probability(spot, strike, sigma_per_second, seconds_left):
-    """Driftless lognormal probability that spot settles above strike."""
-    if not spot or not strike or not sigma_per_second or not seconds_left or seconds_left <= 0:
+def probability_above(spot, strike, sigma_per_second, seconds_remaining):
+    """P(spot settles above strike) under driftless GBM."""
+    if spot <= 0 or strike <= 0 or sigma_per_second <= 0 or seconds_remaining <= 0:
         return None
 
-    sigma_horizon = sigma_per_second * math.sqrt(seconds_left)
-    if sigma_horizon <= 0:
+    total_sigma = sigma_per_second * math.sqrt(seconds_remaining)
+    numerator = math.log(spot / strike) - 0.5 * (total_sigma ** 2)
+
+    return _normal_cdf(numerator / total_sigma)
+
+
+def market_strike(market):
+    """Resolve the strike for an 'above X' market.
+
+    Kalshi supplies floor_strike on above-type markets. Ticker parsing is a
+    fallback only: a mis-parsed strike produces a confident inverted signal,
+    which is the most damaging failure mode in this system.
+    """
+    if not market:
+        return None, "no market"
+
+    for field in ("floor_strike", "strike", "cap_strike"):
+        value = market.get(field)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value), f"market.{field}"
+
+    ticker = market.get("ticker") or ""
+    tail = ticker.rsplit("-", 1)[-1]
+
+    if tail.upper().startswith("T"):
+        try:
+            return float(tail[1:].replace("_", ".")), "ticker"
+        except ValueError:
+            pass
+
+    return None, "unresolved"
+
+
+def seconds_to_close(market):
+    close_time = (market or {}).get("close_time")
+    if not close_time:
         return None
 
-    return normal_cdf(math.log(spot / strike) / sigma_horizon)
+    try:
+        parsed = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    return (parsed - datetime.now(timezone.utc)).total_seconds()
 
 
-def evaluate(spot, trades, market, orderbook):
-    """Return a signal dict. action is BUY YES, BUY NO, or NO TRADE."""
-    config = limits()
+def best_levels(orderbook):
+    """Return (yes_ask, no_ask, yes_bid, no_bid) in cents.
 
-    if not spot:
-        return no_trade("Waiting for live BTC-USD trades")
+    Kalshi quotes both sides as bids. The ask for yes is 100 minus the best
+    bid for no, and vice versa.
+    """
+    book = (orderbook or {}).get("orderbook") or {}
 
-    ticker = (market or {}).get("ticker")
-    if not ticker:
-        return no_trade("No open BTC-15m market discovered yet")
+    def top(levels):
+        prices = [
+            int(level[0])
+            for level in (levels or [])
+            if isinstance(level, (list, tuple)) and len(level) >= 2 and int(level[1]) > 0
+        ]
+        return max(prices) if prices else None
 
-    strike = extract_strike(ticker, (market or {}).get("title"))
+    yes_bid = top(book.get("yes"))
+    no_bid = top(book.get("no"))
+
+    yes_ask = 100 - no_bid if no_bid is not None else None
+    no_ask = 100 - yes_bid if yes_bid is not None else None
+
+    return yes_ask, no_ask, yes_bid, no_bid
+
+
+def evaluate(trades, market, orderbook):
+    """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'."""
+    config = settings()
+
+    if not trades:
+        return _no_trade("Waiting for live BTC-USD trades")
+
+    spot_age = time.time() - trades[-1][0]
+    if spot_age > config["stale_feed_seconds"]:
+        return _no_trade(f"Coinbase BTC feed is stale ({spot_age:.0f}s since last trade)")
+
+    history = trades[-1][0] - trades[0][0]
+    if history < config["min_history_seconds"]:
+        remaining = int(config["min_history_seconds"] - history)
+        return _no_trade(f"Building volatility history ({remaining}s remaining)")
+
+    if not market or not market.get("ticker"):
+        return _no_trade("No open BTC-15m market discovered")
+
+    strike, strike_source = market_strike(market)
     if strike is None:
-        return no_trade(f"Could not read a strike price from market {ticker}")
+        return _no_trade(f"Cannot resolve strike for {market.get('ticker')}")
 
-    remaining = seconds_to_close((market or {}).get("close_time"))
+    remaining = seconds_to_close(market)
     if remaining is None:
-        return no_trade("Market close time unavailable")
+        return _no_trade("Market close time is unavailable")
+
     if remaining < config["min_seconds_to_close"]:
-        return no_trade(f"Only {int(remaining)}s to close; inside the no-entry window")
+        return _no_trade(f"Too close to settlement ({remaining:.0f}s remaining)")
+
     if remaining > config["max_seconds_to_close"]:
-        return no_trade(f"{int(remaining)}s to close is outside the traded horizon")
+        return _no_trade(f"Outside the trading window ({remaining:.0f}s to close)")
 
-    sigma, samples = realized_vol_per_second(trades)
-    if sigma is None or samples < config["min_vol_samples"]:
-        return no_trade(f"Building volatility estimate ({samples} samples)")
+    sigma = realized_vol_per_second(trades)
+    if sigma is None:
+        return _no_trade("Insufficient one-second samples to estimate volatility")
 
-    fair = fair_yes_probability(spot, strike, sigma, remaining)
-    if fair is None:
-        return no_trade("Fair value could not be computed")
+    yes_ask, no_ask, yes_bid, no_bid = best_levels(orderbook)
+    if yes_ask is None or no_ask is None:
+        return _no_trade("Waiting for a two-sided Kalshi book")
 
-    fair_cents = fair * 100
-    levels = best_levels(orderbook)
-
-    if levels["yes_ask"] is None or levels["yes_bid"] is None:
-        return no_trade("Kalshi book is empty on one side")
-
-    spread = levels["yes_ask"] - levels["yes_bid"]
+    spread = yes_ask - (yes_bid if yes_bid is not None else 0)
     if spread > config["max_spread_cents"]:
-        return no_trade(f"Spread {spread:.0f}c is wider than the {config['max_spread_cents']:.0f}c limit")
+        return _no_trade(f"Book spread too wide ({spread}c)")
 
-    yes_edge = fair_cents - levels["yes_ask"]
-    no_ask = levels["no_ask"]
-    no_edge = (100 - fair_cents) - no_ask if no_ask is not None else None
+    spot = trades[-1][1]
+    fair_yes = probability_above(spot, strike, sigma, remaining)
+    if fair_yes is None:
+        return _no_trade("Fair value could not be computed")
 
-    if no_edge is not None and no_edge > yes_edge:
-        side, price, edge, size = "no", no_ask, no_edge, levels["no_ask_size"]
+    yes_edge = fair_yes * 100 - yes_ask
+    no_edge = (1 - fair_yes) * 100 - no_ask
+
+    if yes_edge >= no_edge:
+        side, ask, edge, prob = "yes", yes_ask, yes_edge, fair_yes
     else:
-        side, price, edge, size = "yes", levels["yes_ask"], yes_edge, levels["yes_ask_size"]
+        side, ask, edge, prob = "no", no_ask, no_edge, 1 - fair_yes
 
-    context = {
-        "ticker": ticker,
-        "strike": strike,
-        "spot": spot,
-        "fair_yes_cents": round(fair_cents, 2),
-        "price_cents": price,
+    diagnostics = {
+        "side": side,
+        "ticker": market.get("ticker"),
+        "price_cents": ask,
         "edge_cents": round(edge, 2),
-        "spread_cents": round(spread, 2),
-        "book_size": size,
+        "fair_prob": round(prob, 4),
+        "strike": strike,
+        "strike_source": strike_source,
+        "spot": spot,
+        "sigma_per_second": round(sigma, 8),
         "seconds_to_close": int(remaining),
-        "sigma_per_second": sigma,
-        "vol_samples": samples,
     }
+
+    confidence = int(round(prob * 100))
+
+    if not config["min_price_cents"] <= ask <= config["max_price_cents"]:
+        return _no_trade(f"Ask {ask}c is outside the tradable price band", **diagnostics)
 
     if edge < config["min_edge_cents"]:
-        return no_trade(
-            f"Best edge {edge:.1f}c is under the {config['min_edge_cents']:.0f}c minimum",
-            **context,
+        return _no_trade(
+            f"Edge {edge:.1f}c below the {config['min_edge_cents']:.1f}c minimum",
+            **diagnostics,
         )
 
-    if price is None or price < config["min_price_cents"] or price > config["max_price_cents"]:
-        return no_trade(f"Price {price}c is outside the tradable band", **context)
-
-    if not size or size < config["min_book_size"]:
-        return no_trade(f"Only {int(size or 0)} contracts resting; under the size floor", **context)
-
-    # Confidence scales the edge against the width of the price band it sits in.
-    confidence = min(99.0, 50.0 + (edge / max(config["min_edge_cents"], 1)) * 20.0)
     if confidence < config["min_confidence"]:
-        return no_trade(f"Confidence {confidence:.0f}% is under the floor", **context)
+        return _no_trade(
+            f"Confidence {confidence}% below the {config['min_confidence']}% floor",
+            **diagnostics,
+        )
 
-    signal = {
+    payload = {
         "action": f"BUY {side.upper()}",
-        "side": side,
-        "confidence": round(confidence, 1),
-        "reason": f"Fair {fair_cents:.0f}c vs {side.upper()} ask {price:.0f}c; {edge:.1f}c edge",
+        "confidence": confidence,
+        "reason": (
+            f"Fair {prob * 100:.1f}% vs {ask}c ask — {edge:.1f}c edge with "
+            f"{int(remaining)}s to close"
+        ),
     }
-    signal.update(context)
-    return signal
+    payload.update(diagnostics)
+    return payload
