@@ -6,13 +6,12 @@ Signing contract:
     signature = base64(RSA-PSS(SHA256, salt_length=DIGEST_LENGTH)) over message
     headers   KALSHI-ACCESS-KEY / KALSHI-ACCESS-SIGNATURE / KALSHI-ACCESS-TIMESTAMP
 
-Authentication failures raise KalshiAuthError, which is deliberately a
-different type from KalshiApiError so the trading loop can halt on a bad
-key instead of retrying a request that will never succeed.
+Authentication failures raise KalshiAuthError, deliberately a different type
+from KalshiApiError, so the trading loop can halt on a bad key instead of
+retrying a request that will never succeed.
 """
 
 import base64
-import os
 import time
 from urllib.parse import urlparse
 
@@ -20,8 +19,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
+import config
 
 
 class KalshiAuthError(RuntimeError):
@@ -40,34 +38,25 @@ def _load_private_key(raw):
     pem = raw.replace("\\n", "\n").strip()
 
     try:
-        return serialization.load_pem_private_key(
-            pem.encode("utf-8"),
-            password=None,
-        )
+        return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
     except Exception as error:
         raise KalshiAuthError(
             f"KALSHI_PRIVATE_KEY could not be parsed as a PEM private key: {error}"
         )
 
 
-def environment():
-    return "prod" if os.getenv("KALSHI_ENV", "demo").lower() == "prod" else "demo"
-
-
-def base_url():
-    return PROD_BASE if environment() == "prod" else DEMO_BASE
-
-
 class KalshiClient:
     def __init__(self):
-        self.base_url = base_url()
-        self.environment = environment()
-        self.key_id = os.getenv("KALSHI_API_KEY_ID", "").strip() or None
-        self.order_path = os.getenv("KALSHI_ORDER_PATH", "/portfolio/orders")
+        cfg = config.settings
+        self.base_url = cfg.base_url
+        self.environment = cfg.kalshi_env
+        self.key_id = cfg.key_id or None
+        self.order_path = cfg.order_path
         self._key_error = None
+        self._tif_unsupported = False
 
         try:
-            self.private_key = _load_private_key(os.getenv("KALSHI_PRIVATE_KEY"))
+            self.private_key = _load_private_key(cfg.private_key_pem)
         except KalshiAuthError as error:
             self.private_key = None
             self._key_error = str(error)
@@ -154,6 +143,10 @@ class KalshiClient:
             authenticate=False,
         )
 
+    async def get_market(self, ticker):
+        payload = await self.request("GET", f"/markets/{ticker}", authenticate=False)
+        return payload.get("market") or payload
+
     async def get_orderbook(self, ticker, depth=10):
         return await self.request(
             "GET",
@@ -180,21 +173,36 @@ class KalshiClient:
             params["ticker"] = ticker
         return await self.request("GET", "/portfolio/fills", params=params)
 
-    async def create_order(self, ticker, side, count, price_cents, client_order_id):
-        """Buy `count` contracts of `side` ('yes'/'no') as a limit order.
+    async def create_order(
+        self,
+        ticker,
+        side,
+        count,
+        price_cents,
+        client_order_id,
+        action="buy",
+        time_in_force=None,
+    ):
+        """Place a limit order.
 
-        Limit, not market: a market order on a thin 15-minute book can fill far
-        from the price the edge was calculated against, which would silently
-        invalidate the decision that produced it.
+        Limit, never market: a market order on a thin 15-minute book can fill
+        far from the price the edge was calculated against, which silently
+        invalidates the decision that produced it.
+
+        Time in force differs by direction, and the asymmetry is deliberate.
+        Entries are fill-or-kill -- a partially filled entry leaves an odd lot
+        the ladder cannot scale out of cleanly. Exits are
+        immediate-or-cancel -- when taking profit or stopping out, a partial
+        exit is strictly better than no exit, and nothing should be left
+        resting on the book unattended.
         """
         body = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action,
             "side": side,
             "count": int(count),
             "type": "limit",
             "client_order_id": client_order_id,
-            "time_in_force": "fill_or_kill",
         }
 
         if side == "yes":
@@ -202,7 +210,34 @@ class KalshiClient:
         else:
             body["no_price"] = int(price_cents)
 
-        return await self.request("POST", self.order_path, body=body)
+        if not self._tif_unsupported:
+            if time_in_force:
+                body["time_in_force"] = time_in_force
+            elif action == "buy":
+                body["time_in_force"] = "fill_or_kill"
+            else:
+                body["time_in_force"] = config.settings.exit_tif
+
+        try:
+            return await self.request("POST", self.order_path, body=body)
+        except KalshiApiError as error:
+            # Some environments reject an unrecognised time_in_force. Retry once
+            # without it rather than failing an exit that needs to happen.
+            if "time_in_force" in str(error) and "time_in_force" in body:
+                self._tif_unsupported = True
+                body.pop("time_in_force")
+                return await self.request("POST", self.order_path, body=body)
+            raise
+
+    async def sell(self, ticker, side, count, price_cents, client_order_id):
+        return await self.create_order(
+            ticker=ticker,
+            side=side,
+            count=count,
+            price_cents=price_cents,
+            client_order_id=client_order_id,
+            action="sell",
+        )
 
     async def selftest(self):
         """Verify signing and read-only portfolio access without placing an order."""

@@ -2,7 +2,7 @@
 
 Removing a human approval step does not make a system autonomous; it makes it
 unbounded. What made approval a control was that a person could refuse. These
-limits are the refusal, expressed in code and checked before every order.
+limits are the refusal, expressed in code and checked before every entry.
 
 Design notes:
   - The daily loss limit is measured against the Kalshi account balance, not a
@@ -10,35 +10,30 @@ Design notes:
     understating losses, which is the direction that hurts.
   - A breached loss limit latches a halt to disk. A restart is not a reset;
     Railway restarting the container must not resume trading.
-  - Every decision is logged, including the ones that were blocked. Reviewing
-    only the trades that happened hides the near-misses.
+  - These gates apply to ENTRIES only. Exits are never blocked by a cooldown,
+    a daily cap, or a halt -- a system that cannot close a position it already
+    holds is more dangerous than one that cannot open a new one.
+  - Every decision is logged, including blocked ones. Reviewing only the trades
+    that happened hides the near-misses, which is where a scalper's real
+    behaviour lives.
 """
 
 import json
-import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
-STATE_PATH = Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json"))
-LOG_PATH = Path(os.getenv("DECISION_LOG_PATH", "data/decisions.jsonl"))
-
-
-def _env_int(name, default):
-    try:
-        return int(float(os.getenv(name, default)))
-    except (TypeError, ValueError):
-        return int(default)
+import config
 
 
 def limits():
+    cfg = config.settings
     return {
-        "max_contracts_per_trade": _env_int("MAX_CONTRACTS_PER_TRADE", 5),
-        "max_cost_per_trade_cents": _env_int("MAX_COST_PER_TRADE_CENTS", 500),
-        "max_open_positions": _env_int("MAX_OPEN_POSITIONS", 1),
-        "max_trades_per_day": _env_int("MAX_TRADES_PER_DAY", 12),
-        "daily_loss_limit_cents": _env_int("DAILY_LOSS_LIMIT_CENTS", 2000),
-        "cooldown_seconds": _env_int("COOLDOWN_SECONDS", 60),
+        "max_contracts_per_trade": cfg.max_contracts_per_trade,
+        "max_cost_per_trade_cents": cfg.max_cost_per_trade_cents,
+        "max_open_positions": cfg.max_open_positions,
+        "max_trades_per_day": cfg.max_trades_per_day,
+        "daily_loss_limit_cents": cfg.daily_loss_limit_cents,
+        "cooldown_seconds": cfg.cooldown_seconds,
     }
 
 
@@ -61,7 +56,7 @@ def _blank_state():
 
 def load_state():
     try:
-        state = json.loads(STATE_PATH.read_text())
+        state = json.loads(config.settings.risk_state_path.read_text())
     except Exception:
         state = _blank_state()
 
@@ -81,8 +76,9 @@ def load_state():
 
 def save_state(state):
     try:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(state, indent=2))
+        path = config.settings.risk_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2))
     except Exception:
         pass
 
@@ -92,16 +88,17 @@ def log_decision(record):
     record["logged_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
+        path = config.settings.decision_log_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
     except Exception:
         pass
 
 
 def read_decisions(limit=50):
     try:
-        lines = LOG_PATH.read_text().strip().splitlines()
+        lines = config.settings.decision_log_path.read_text().strip().splitlines()
     except Exception:
         return []
 
@@ -133,6 +130,10 @@ def resume():
     save_state(state)
     log_decision({"event": "resume"})
     return state
+
+
+def is_halted():
+    return bool(load_state().get("halted"))
 
 
 def note_balance(balance_cents):
@@ -173,51 +174,57 @@ def record_trade(ticker, count, cost_cents):
 
 
 def check(signal, balance_cents, open_position_count, open_tickers):
-    """Decide whether the signal may be executed.
+    """Decide whether an ENTRY may be executed.
 
     Returns (approved: bool, reason: str, sizing: dict|None).
     """
-    config = limits()
+    cfg = config.settings
+    config_limits = limits()
     state = load_state()
 
     if state.get("halted"):
         return False, f"Trading halted: {state.get('halt_reason')}", None
 
     drawdown = drawdown_cents(balance_cents)
-    if drawdown is not None and drawdown >= config["daily_loss_limit_cents"]:
+    if drawdown is not None and drawdown >= config_limits["daily_loss_limit_cents"]:
         halt(
             f"Daily loss limit reached (down {drawdown}c of "
-            f"{config['daily_loss_limit_cents']}c allowed)"
+            f"{config_limits['daily_loss_limit_cents']}c allowed)"
         )
         return False, "Daily loss limit reached", None
 
-    if state.get("trades_today", 0) >= config["max_trades_per_day"]:
-        return False, f"Daily trade cap reached ({config['max_trades_per_day']})", None
+    if state.get("trades_today", 0) >= config_limits["max_trades_per_day"]:
+        return False, f"Daily trade cap reached ({config_limits['max_trades_per_day']})", None
 
-    if open_position_count >= config["max_open_positions"]:
-        return False, f"Open position cap reached ({config['max_open_positions']})", None
+    if open_position_count >= config_limits["max_open_positions"]:
+        return False, f"Open position cap reached ({config_limits['max_open_positions']})", None
 
     ticker = signal.get("ticker")
     if ticker and ticker in (open_tickers or []):
-        return False, f"Already holding a position in {ticker}", None
+        return False, f"Already scalping {ticker}", None
 
     elapsed = time.time() - float(state.get("last_trade_at") or 0)
-    if elapsed < config["cooldown_seconds"]:
-        wait = int(config["cooldown_seconds"] - elapsed)
-        return False, f"Cooldown active ({wait}s remaining)", None
+    if elapsed < config_limits["cooldown_seconds"]:
+        return False, f"Cooldown active ({int(config_limits['cooldown_seconds'] - elapsed)}s)", None
 
     price = int(signal.get("price_cents") or 0)
     if price <= 0:
         return False, "Signal carries no executable price", None
 
-    count = config["max_contracts_per_trade"]
-    affordable = config["max_cost_per_trade_cents"] // price
-    count = min(count, affordable)
+    count = min(
+        config_limits["max_contracts_per_trade"],
+        config_limits["max_cost_per_trade_cents"] // price,
+    )
+
+    # Never size past the resting bid we intend to scalp out into.
+    exit_size = signal.get("exit_bid_size")
+    if isinstance(exit_size, int) and exit_size > 0:
+        count = min(count, exit_size)
 
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
 
     if count < 1:
-        return False, "Per-trade cost cap or balance allows fewer than 1 contract", None
+        return False, "Cost cap, balance, or exit liquidity allows fewer than 1 contract", None
 
     return True, "Within limits", {"count": count, "cost_cents": count * price}
