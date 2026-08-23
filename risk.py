@@ -4,20 +4,20 @@ Removing a human approval step does not make a system autonomous; it makes it
 unbounded. What made approval a control was that a person could refuse. These
 limits are the refusal, expressed in code and checked before every entry.
 
-Scope note: everything here governs ENTRIES. The exit engine deliberately runs
-outside these checks -- see trader.manage_exits. A cap that could block an exit
-would strand an open position, which is not what a limit is for.
-
 Design notes:
   - The daily loss limit is measured against the Kalshi account balance, not a
     locally accumulated tally. A local tally that misses a fill drifts toward
-    understating losses, which is the direction that hurts. With a scalper
-    closing positions many times an hour, balance is also the only figure that
-    reflects fees.
+    understating losses, which is the direction that hurts.
   - A breached loss limit latches a halt to disk. A restart is not a reset;
-    Railway restarting the container must not resume entries.
+    Railway restarting the container must not resume trading.
+  - A halt stops ENTRIES. The trader keeps running exits, because abandoning an
+    open position is not a safety measure.
   - Every decision is logged, including blocked ones. Reviewing only the trades
     that happened hides the near-misses.
+  - Scalping changes the shape of these limits, not their purpose: the trade
+    count per day is higher and the cooldown much shorter, because the whole
+    point is many small round trips. The loss cap is what actually bounds the
+    day, and it does not care how many trades produced the loss.
 """
 
 import json
@@ -65,12 +65,12 @@ def load_state():
     # A new UTC day resets counters and clears an automatic halt. A manual halt
     # persists until it is explicitly resumed.
     if state.get("day") != _today():
-        manual = bool(state.get("halted") and state.get("halt_is_manual"))
+        manual = state.get("halted") and state.get("halt_is_manual")
         reason = state.get("halt_reason") if manual else None
         state = _blank_state()
-        state["halted"] = manual
+        state["halted"] = bool(manual)
         state["halt_reason"] = reason
-        state["halt_is_manual"] = manual
+        state["halt_is_manual"] = bool(manual)
         save_state(state)
 
     return state
@@ -85,10 +85,6 @@ def save_state(state):
         pass
 
 
-def is_halted():
-    return bool(load_state().get("halted"))
-
-
 def log_decision(record):
     record = dict(record)
     record["logged_at"] = datetime.now(timezone.utc).isoformat()
@@ -97,7 +93,7 @@ def log_decision(record):
         path = config.settings.decision_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as handle:
-            handle.write(json.dumps(record, default=str) + "\n")
+            handle.write(json.dumps(record) + "\n")
     except Exception:
         pass
 
@@ -123,6 +119,10 @@ def read_decisions(limit=50, event=None):
     return records
 
 
+def is_halted():
+    return bool(load_state().get("halted"))
+
+
 def halt(reason, manual=False):
     state = load_state()
     state["halted"] = True
@@ -144,7 +144,7 @@ def resume():
 
 
 def note_balance(balance_cents):
-    """Record the day's opening balance the first time one is observed."""
+    """Record the day's opening balance the first time a balance is observed."""
     if balance_cents is None:
         return load_state()
 
@@ -181,8 +181,9 @@ def record_trade(ticker, count, cost_cents):
 
 
 def check(signal, balance_cents, open_position_count, open_tickers):
-    """Decide whether a new entry may be opened.
+    """Decide whether an ENTRY may be executed.
 
+    Exits are never routed through here; see the module docstring.
     Returns (approved: bool, reason: str, sizing: dict|None).
     """
     cfg = config.settings
@@ -225,9 +226,8 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
 
-    # Never size beyond what we could sell into: the ladder needs a bid on the
-    # other side, and a position larger than the resting size cannot be scalped
-    # out of at the target.
+    # Never size beyond what the exit side can absorb. Entering 6 contracts
+    # against a 2-lot bid means the ladder cannot sell what it just bought.
     exit_size = signal.get("exit_bid_size")
     if isinstance(exit_size, int) and exit_size > 0:
         count = min(count, exit_size)
