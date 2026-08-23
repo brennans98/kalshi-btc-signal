@@ -159,13 +159,58 @@ def seconds_to_close(market):
     return None if epoch is None else epoch - time.time()
 
 
+def _normalize_orderbook_fp(raw):
+    """Convert Kalshi's orderbook_fp format to the canonical integer-cents format.
+
+    Kalshi's production API returns:
+        {"orderbook_fp": {"yes_dollars": [["0.4300", "2514.00"], ...],
+                          "no_dollars":  [["0.3800", "2607.00"], ...]}}
+
+    We normalise this to:
+        {"orderbook": {"yes": [[43, 2514], ...],
+                       "no":  [[38, 2607], ...]}}
+
+    so the rest of the codebase works against a single stable schema.
+    Dollar prices are multiplied by 100 and rounded to the nearest cent.
+    Sizes are rounded to the nearest whole contract.
+    """
+    fp = (raw or {}).get("orderbook_fp")
+    if not fp:
+        return raw  # already canonical or None
+
+    def convert(levels):
+        result = []
+        for level in levels or []:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            try:
+                price_cents = round(float(level[0]) * 100)
+                size = round(float(level[1]))
+            except (TypeError, ValueError):
+                continue
+            if size > 0:
+                result.append([price_cents, size])
+        return result
+
+    return {
+        "orderbook": {
+            "yes": convert(fp.get("yes_dollars")),
+            "no": convert(fp.get("no_dollars")),
+        }
+    }
+
+
 def book_snapshot(orderbook):
     """Top of book with resting sizes, in cents.
 
     Kalshi quotes both sides as bids. The ask for yes is 100 minus the best
     bid for no, and vice versa.
+
+    Handles both the legacy integer format and the current orderbook_fp
+    dollar-string format returned by Kalshi's production API.
     """
-    book = (orderbook or {}).get("orderbook") or {}
+    normalised = _normalize_orderbook_fp(orderbook)
+    book = (normalised or {}).get("orderbook") or {}
 
     def top(levels):
         best_price = None
