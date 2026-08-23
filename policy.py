@@ -3,18 +3,20 @@
 What this asks is narrower than "will this contract settle yes". It asks:
 is this contract mispriced right now, and can it travel far enough, soon
 enough, for the exit ladder to bank a few cents before the hold window or the
-settlement guard closes the trade?
+settlement guard closes the trade, after fees?
 
-Three gates matter more here than in a hold-to-settlement design:
+Four gates matter more here than in a hold-to-settlement design:
 
   1. Expected move. If the contract cannot plausibly move the small target's
      worth of cents inside the hold window, the edge is unharvestable no matter
-     how real it is. Sitting in a correctly-priced-but-static contract is how a
-     scalper bleeds fees and time.
+     how real it is.
   2. Exit liquidity. The entry is only half the trade. If there is no resting
      size on the side we would sell into, we can enter and not get out.
   3. Spread. Crossing a wide spread means starting the scalp several cents
      underwater, which the small target may never recover.
+  4. Fees. Kalshi charges ceil(0.07 * C * P * (1-P)) cents per fill, which
+     peaks near the 50c midpoint. An edge that looks real before fees can be
+     a guaranteed loss after both the entry and exit fill are charged.
 
 Every rejection returns a specific reason. "Expected move 1.8c short of the 3c
 small target" is debuggable; a bare NO TRADE is not.
@@ -42,12 +44,7 @@ def _normal_pdf(x):
 
 
 def realized_vol_per_second(trades, window_seconds=None):
-    """Standard deviation of one-second log returns.
-
-    Sampling at one second rather than per-trade keeps the estimate from being
-    inflated by trade-rate bursts, which is the usual way a naive tick-level
-    estimate manufactures a fake edge.
-    """
+    """Standard deviation of one-second log returns."""
     cfg = config.settings
     window_seconds = window_seconds or cfg.vol_window_seconds
 
@@ -99,14 +96,7 @@ def probability_above(spot, strike, sigma_per_second, seconds_remaining):
 
 
 def expected_move_cents(z, horizon_seconds, seconds_remaining):
-    """Roughly how many cents this contract's price travels over the horizon.
-
-    prob = Phi(z) with z scaling as 1/sqrt(T), so a one-sigma spot move over a
-    horizon h shifts z by sqrt(h / T). In price terms that is
-    phi(z) * sqrt(h / T) * 100 cents. Crude, but it is the right question: a
-    deep out-of-the-money contract with a tiny phi(z) barely moves even when
-    spot does, and is therefore not scalpable.
-    """
+    """Roughly how many cents this contract's price travels over the horizon."""
     if z is None or seconds_remaining <= 0 or horizon_seconds <= 0:
         return None
 
@@ -115,12 +105,7 @@ def expected_move_cents(z, horizon_seconds, seconds_remaining):
 
 
 def market_strike(market):
-    """Resolve the strike for an 'above X' market.
-
-    Kalshi supplies floor_strike on above-type markets. Ticker parsing is a
-    fallback only: a mis-parsed strike produces a confident inverted signal,
-    which is the most damaging failure mode in this system.
-    """
+    """Resolve the strike for an 'above X' market."""
     if not market:
         return None, "no market"
 
@@ -159,6 +144,38 @@ def seconds_to_close(market):
     return None if epoch is None else epoch - time.time()
 
 
+def taker_fee_cents(count, price_cents):
+    """Kalshi's published taker fee: ceil(0.07 * C * P * (1-P) * 100) cents,
+    where P is the price expressed as a fraction of a dollar (price_cents/100).
+    """
+    if count <= 0 or price_cents is None:
+        return 0.0
+    p = max(0.0, min(1.0, price_cents / 100.0))
+    return math.ceil(0.07 * count * p * (1 - p) * 100) / 1.0
+
+
+def maker_fee_cents(count, price_cents):
+    """Resting/limit orders that provide liquidity pay roughly half the taker fee."""
+    return taker_fee_cents(count, price_cents) * 0.5
+
+
+def round_trip_fee_cents(count, entry_price_cents, exit_price_cents, entry_is_maker=False):
+    """Fee is charged on both the entry fill and the exit fill.
+
+    Entries in this system are fill-or-kill limit orders crossing the ask, so
+    they are takers. Exits are immediate-or-cancel limit orders selling into
+    the bid, also takers. If either leg is later changed to a resting maker
+    order, pass entry_is_maker=True to reflect the discount.
+    """
+    entry_fee = (
+        maker_fee_cents(count, entry_price_cents)
+        if entry_is_maker
+        else taker_fee_cents(count, entry_price_cents)
+    )
+    exit_fee = taker_fee_cents(count, exit_price_cents)
+    return entry_fee + exit_fee
+
+
 def _normalize_orderbook_fp(raw):
     """Convert Kalshi's orderbook_fp format to the canonical integer-cents format.
 
@@ -171,8 +188,6 @@ def _normalize_orderbook_fp(raw):
                        "no":  [[38, 2607], ...]}}
 
     so the rest of the codebase works against a single stable schema.
-    Dollar prices are multiplied by 100 and rounded to the nearest cent.
-    Sizes are rounded to the nearest whole contract.
     """
     fp = (raw or {}).get("orderbook_fp")
     if not fp:
@@ -202,9 +217,6 @@ def _normalize_orderbook_fp(raw):
 
 def book_snapshot(orderbook):
     """Top of book with resting sizes, in cents.
-
-    Kalshi quotes both sides as bids. The ask for yes is 100 minus the best
-    bid for no, and vice versa.
 
     Handles both the legacy integer format and the current orderbook_fp
     dollar-string format returned by Kalshi's production API.
@@ -320,6 +332,11 @@ def evaluate(trades, market, orderbook):
     tiers = cfg.tiers()
     confidence = int(round(prob * 100))
 
+    count_estimate = max(1, cfg.max_contracts_per_trade)
+    est_exit_price = exit_bid if exit_bid is not None else ask
+    fee_cents_total = round_trip_fee_cents(count_estimate, ask, est_exit_price)
+    fee_cents_per_contract = fee_cents_total / count_estimate
+
     diagnostics = {
         "side": side,
         "ticker": market.get("ticker"),
@@ -335,6 +352,7 @@ def evaluate(trades, market, orderbook):
         "sigma_per_second": round(sigma, 8),
         "seconds_to_close": int(remaining),
         "expected_move_cents": None if move is None else round(move, 2),
+        "fee_cents_per_contract": round(fee_cents_per_contract, 2),
         "scalp_targets": {
             tier.name: min(99, ask + tier.cents) for tier in tiers
         },
@@ -354,9 +372,13 @@ def evaluate(trades, market, orderbook):
             **diagnostics,
         )
 
-    if edge < cfg.min_edge_cents:
+    min_required_edge = max(cfg.min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
+
+    if edge < min_required_edge:
         return _no_trade(
-            f"Edge {edge:.1f}c below the {cfg.min_edge_cents:.1f}c minimum", **diagnostics
+            f"Edge {edge:.1f}c below the fee-adjusted minimum {min_required_edge:.1f}c "
+            f"(fees ~{fee_cents_per_contract:.1f}c/contract round-trip)",
+            **diagnostics,
         )
 
     if confidence < cfg.min_confidence:
@@ -375,7 +397,8 @@ def evaluate(trades, market, orderbook):
         "action": f"BUY {side.upper()}",
         "confidence": confidence,
         "reason": (
-            f"Fair {prob * 100:.1f}% vs {ask}c ask - {edge:.1f}c edge, "
+            f"Fair {prob * 100:.1f}% vs {ask}c ask - {edge:.1f}c edge "
+            f"({fee_cents_per_contract:.1f}c fees included), "
             f"~{move:.1f}c expected travel, scalping to "
             f"{'/'.join(str(tier.cents) for tier in tiers)}c"
         ),
