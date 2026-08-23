@@ -10,11 +10,10 @@ Authentication failures raise KalshiAuthError, deliberately a different type
 from KalshiApiError, so the trading loop can halt on a bad key instead of
 retrying a request that will never succeed.
 
-Entries and exits use different time-in-force. An entry is fill-or-kill: a
-partial fill at a price the edge was not calculated against is not the trade we
-decided on. An exit is immediate-or-cancel: taking part of the way out is
-strictly better than staying fully exposed, and the ladder will re-offer the
-remainder on the next tick.
+Scalping needs the sell side, which the previous version lacked entirely: it
+could only open positions. Exits use immediate-or-cancel so a stop cannot rest
+unfilled while price keeps moving, with a fallback for venues that reject the
+time_in_force field.
 """
 
 import base64
@@ -59,8 +58,7 @@ class KalshiClient:
         self.key_id = cfg.key_id or None
         self.order_path = cfg.order_path
         self._key_error = None
-        # Set if the venue rejects our time_in_force field, so we stop sending it.
-        self._tif_unsupported = False
+        self._tif_supported = True
 
         try:
             self.private_key = _load_private_key(cfg.private_key_pem)
@@ -112,8 +110,8 @@ class KalshiClient:
             headers = self._sign(method, endpoint)
 
         try:
-            async with httpx.AsyncClient(timeout=15) as http:
-                response = await http.request(
+            async with httpx.AsyncClient(timeout=15) as http_client:
+                response = await http_client.request(
                     method.upper(),
                     f"{self.base_url}{endpoint}",
                     params=params,
@@ -138,7 +136,10 @@ class KalshiClient:
         if not response.content:
             return {}
 
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:
+            return {}
 
     # ---- market data (public) ----
 
@@ -151,7 +152,8 @@ class KalshiClient:
         )
 
     async def get_market(self, ticker):
-        return await self.request("GET", f"/markets/{ticker}", authenticate=False)
+        payload = await self.request("GET", f"/markets/{ticker}", authenticate=False)
+        return payload.get("market") or payload
 
     async def get_orderbook(self, ticker, depth=10):
         return await self.request(
@@ -182,24 +184,19 @@ class KalshiClient:
     # ---- orders ----
 
     async def _place(self, body):
-        """POST an order, retrying once without time_in_force if it is rejected.
+        """POST an order, retrying once without time_in_force if that is rejected.
 
-        Kalshi has moved the order surface more than once. Rather than guess
-        which time_in_force spelling this account's endpoint accepts, drop the
-        field on the first rejection that names it and remember that for the
-        rest of the process. An exit must not fail because of an optional field.
+        Kalshi has changed the accepted values for this field over time. A stop
+        that fails to place because of a field name is worse than a stop that
+        places as a plain limit, so degrade rather than abort.
         """
-        if self._tif_unsupported:
-            body.pop("time_in_force", None)
-
         try:
             return await self.request("POST", self.order_path, body=body)
         except KalshiApiError as error:
-            message = str(error).lower()
-            if "time_in_force" in message and "time_in_force" in body:
-                self._tif_unsupported = True
-                body.pop("time_in_force", None)
-                return await self.request("POST", self.order_path, body=body)
+            if "time_in_force" in str(error) and "time_in_force" in body:
+                self._tif_supported = False
+                retry = {key: value for key, value in body.items() if key != "time_in_force"}
+                return await self.request("POST", self.order_path, body=retry)
             raise
 
     def _order_body(self, ticker, action, side, count, price_cents, client_order_id, tif):
@@ -212,47 +209,49 @@ class KalshiClient:
             "client_order_id": client_order_id,
         }
 
-        if tif:
-            body["time_in_force"] = tif
-
-        # The price field is named for the side being traded, on both buys and
-        # sells: selling yes at 62c is yes_price=62.
+        price = max(1, min(99, int(price_cents)))
         if side == "yes":
-            body["yes_price"] = int(price_cents)
+            body["yes_price"] = price
         else:
-            body["no_price"] = int(price_cents)
+            body["no_price"] = price
+
+        if tif and self._tif_supported:
+            body["time_in_force"] = tif
 
         return body
 
     async def create_order(
         self, ticker, side, count, price_cents, client_order_id, action="buy"
     ):
-        """Place a limit order.
+        """Open a position with a fill-or-kill limit order.
 
         Limit, not market: a market order on a thin 15-minute book can fill far
         from the price the edge was calculated against, which would silently
-        invalidate the decision that produced it.
+        invalidate the decision that produced it. Fill-or-kill because a
+        partially filled scalp entry leaves the ladder sizing wrong.
         """
-        tif = "fill_or_kill" if action == "buy" else config.settings.exit_tif
         body = self._order_body(
-            ticker, action, side, count, price_cents, client_order_id, tif
+            ticker, action, side, count, price_cents, client_order_id, "fill_or_kill"
         )
         return await self._place(body)
 
-    async def sell(self, ticker, side, count, price_cents, client_order_id):
-        """Exit `count` contracts of `side` at a limit price.
+    async def sell(self, ticker, side, count, price_cents, client_order_id, tif=None):
+        """Close all or part of a position.
 
-        Uses immediate-or-cancel rather than fill-or-kill: a partial exit is
-        better than no exit, and the ladder re-offers the remainder next tick.
+        Immediate-or-cancel by default: an exit that rests unfilled is not an
+        exit. Anything not filled is re-offered on the next tick at the new bid,
+        which is the correct behaviour for a stop in a moving market.
         """
-        return await self.create_order(
-            ticker=ticker,
-            side=side,
-            count=count,
-            price_cents=price_cents,
-            client_order_id=client_order_id,
-            action="sell",
+        body = self._order_body(
+            ticker,
+            "sell",
+            side,
+            count,
+            price_cents,
+            client_order_id,
+            tif or config.settings.exit_tif,
         )
+        return await self._place(body)
 
     async def selftest(self):
         """Verify signing and read-only portfolio access without placing an order."""

@@ -4,19 +4,21 @@ Removing a human approval step does not make a system autonomous; it makes it
 unbounded. What made approval a control was that a person could refuse. These
 limits are the refusal, expressed in code and checked before every entry.
 
-Scope note: this module gates ENTRIES ONLY. Exits are never routed through
-check(). A cooldown or a daily cap that could block closing a position would
-turn a risk control into a risk, and a scalper that can open but not close is
-worse than one that does nothing.
-
 Design notes:
   - The daily loss limit is measured against the Kalshi account balance, not a
     locally accumulated tally. A local tally that misses a fill drifts toward
     understating losses, which is the direction that hurts.
   - A breached loss limit latches a halt to disk. A restart is not a reset;
     Railway restarting the container must not resume trading.
-  - Every decision is logged, including blocked ones. Reviewing only the
-    trades that happened hides the near-misses.
+  - Every decision is logged, including blocked ones. Reviewing only the trades
+    that happened hides the near-misses.
+  - These gates apply to ENTRIES ONLY. The exit ladder never consults them, so
+    a cooldown or a daily cap can never trap an open position.
+
+A scalper trips these limits far more often than a hold-to-settlement trader,
+because it trades many times an hour. The daily trade cap is the one most worth
+setting deliberately: it is what bounds fee bleed on a day when the model is
+finding edge that is not really there.
 """
 
 import json
@@ -64,12 +66,12 @@ def load_state():
     # A new UTC day resets counters and clears an automatic halt. A manual halt
     # persists until it is explicitly resumed.
     if state.get("day") != _today():
-        manual = bool(state.get("halted") and state.get("halt_is_manual"))
+        manual = state.get("halted") and state.get("halt_is_manual")
         reason = state.get("halt_reason") if manual else None
         state = _blank_state()
-        state["halted"] = manual
+        state["halted"] = bool(manual)
         state["halt_reason"] = reason
-        state["halt_is_manual"] = manual
+        state["halt_is_manual"] = bool(manual)
         save_state(state)
 
     return state
@@ -178,6 +180,7 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     """Decide whether a new ENTRY may be executed.
 
     Returns (approved: bool, reason: str, sizing: dict|None).
+    Exits never call this.
     """
     cfg = config.settings
     state = load_state()
@@ -211,12 +214,16 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     if price <= 0:
         return False, "Signal carries no executable price", None
 
-    count = min(cfg.max_contracts_per_trade, cfg.max_cost_per_trade_cents // price)
+    count = min(
+        cfg.max_contracts_per_trade,
+        cfg.max_cost_per_trade_cents // price,
+    )
 
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
 
-    # Never size beyond what we could actually sell back into.
+    # Never buy more than the resting exit-side size: a scalp that cannot be
+    # sold in one go is a position, not a scalp.
     exit_size = signal.get("exit_bid_size")
     if isinstance(exit_size, int) and exit_size > 0:
         count = min(count, exit_size)
