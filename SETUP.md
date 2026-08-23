@@ -1,93 +1,133 @@
 # Autonomous trading setup
 
-The system now has a complete path from live data to a placed order. It ships
-switched **off**: with no configuration it behaves exactly as before, except
-the signal is real instead of a permanent `NO TRADE`.
+The system defaults to fully inert: `TRADING_MODE=off` and `KALSHI_ENV=demo`.
+Deploying this branch changes no execution behaviour. The only visible change is
+that the dashboard signal becomes real instead of a permanent 0%.
 
-Turning on autonomy is three environment settings and a deliberate sequence.
+Work through the stages in order. Do not skip stage 3.
 
-## 1. Credentials
+---
 
-Create an API key in your Kalshi account settings. You get a **key id** and
-download a **private key** file once. Set both in Railway (Variables tab) -
-never in the repository.
+## Stage 1 — real signal, no credentials
+
+Nothing to set. Deploy and confirm the dashboard now shows a live fair value,
+book prices, and a specific reason when it says NO TRADE (for example "Best edge
+2.1c is under the 6c minimum" rather than the old placeholder).
+
+If it reports `Could not read a strike price from market ...`, the ticker format
+differs from what `policy.extract_strike` expects. Send the ticker and it can be
+fixed in one line. **This matters more than it looks** — a mis-parsed strike
+produces a confident, inverted signal.
+
+## Stage 2 — credentials, still no orders
+
+Create an API key in your Kalshi account (Settings, API keys). You get a key ID
+and download an RSA private key once.
+
+In Railway, set:
 
 | Variable | Value |
-| --- | --- |
-| `KALSHI_API_KEY_ID` | the key id |
-| `KALSHI_PRIVATE_KEY` | the full PEM contents, `-----BEGIN...` through `-----END...` |
-| `KALSHI_ENV` | `demo` to start, `prod` for real money |
-| `ADMIN_TOKEN` | any long random string - protects the kill switch |
+|---|---|
+| `KALSHI_KEY_ID` | your key ID |
+| `KALSHI_PRIVATE_KEY` | full PEM contents, `-----BEGIN...` through `-----END...` |
+| `KALSHI_ENV` | `demo` |
+| `ADMIN_TOKEN` | any long random string you choose |
+| `DATA_DIR` | `/app/data` |
 
-Pasting the PEM as a multi-line value works; so does a single line with `\n`
-escapes, which are converted on load.
+Attach a Railway volume mounted at `/app/data`. Without it, a restart resets the
+daily loss counter and clears a latched halt.
 
-## 2. Mode
+Paste the private key directly into Railway's variable editor. Never commit it.
+`\n`-escaped single-line PEMs are handled automatically.
 
-`TRADING_MODE` controls autonomy and is the only switch that matters:
+Verify:
 
-| Value | Behaviour |
-| --- | --- |
-| `off` | default - evaluates nothing, places nothing |
-| `dryrun` | evaluates fully and logs every intended order, places nothing |
-| `live` | places real orders |
+```
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/selftest
+```
 
-## 3. Limits
+You want `signing_ok: true` and `balance_ok: true`. If signing fails, the key is
+malformed. If signing succeeds but balance fails, the key lacks permissions or
+is for the wrong environment.
 
-All optional, all with conservative defaults. These are what stand in for
-your approval, so set them deliberately.
+## Stage 3 — dry run (do not skip)
+
+Set `TRADING_MODE=dryrun`.
+
+The loop now evaluates continuously and logs every order it *would* have placed
+to `$DATA_DIR/decisions.jsonl`, through the identical code path live uses. No
+orders are sent.
+
+Let it run across a meaningful sample, then read the log and ask the question
+that actually matters: **would you have approved each of these?** This is the
+step that tells you whether the thresholds encode your judgment. Tune
+`MIN_EDGE_CENTS`, `MIN_CONFIDENCE`, and the spread and size floors until the
+answer is yes.
+
+## Stage 4 — live on demo money
+
+Set `TRADING_MODE=live`, keep `KALSHI_ENV=demo`. Real order placement, fake
+money. Confirm orders appear in your Kalshi demo account, fills reconcile, and
+the halt endpoint works:
+
+```
+curl -X POST -H "x-admin-token: YOUR_ADMIN_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/halt
+```
+
+## Stage 5 — production, minimum size
+
+Set `KALSHI_ENV=prod`. Leave every cap at its default (1 contract, $5/trade,
+$20/day). Scale only after a real sample of live fills.
+
+---
+
+## Limits
+
+All optional; defaults shown. These are what replace your approval step.
 
 | Variable | Default | Meaning |
-| --- | --- | --- |
-| `MIN_EDGE` | `0.06` | required edge over the book, in probability (0.06 = 6c) |
-| `MIN_CONFIDENCE` | `60` | model probability floor for the chosen side |
-| `MAX_CONTRACTS_PER_TRADE` | `5` | hard contract cap |
-| `MAX_TRADE_COST_DOLLARS` | `5` | hard dollar cap per order |
-| `DAILY_LOSS_LIMIT_DOLLARS` | `20` | breaching this halts trading for the day |
-| `MAX_TRADES_PER_DAY` | `10` | daily order cap |
-| `MAX_OPEN_POSITIONS` | `1` | concurrent position cap |
-| `COOLDOWN_SECONDS` | `120` | minimum gap between orders |
-| `MAX_SPREAD_CENTS` | `6` | skip illiquid books |
-| `MIN_BOOK_SIZE` | `20` | required resting size at the price |
-| `MIN_SECONDS_TO_CLOSE` | `90` | no entries inside the last 90s |
-| `MAX_SECONDS_TO_CLOSE` | `720` | no entries before the window is in range |
-| `KALSHI_ORDER_PATH` | `/portfolio/orders` | set to `/portfolio/events/orders` if your account uses the V2 order surface |
+|---|---|---|
+| `MAX_CONTRACTS_PER_TRADE` | `1` | Hard contract cap |
+| `MAX_DOLLARS_PER_TRADE` | `5` | Dollar cap; sizing takes the tighter of the two |
+| `DAILY_LOSS_LIMIT_DOLLARS` | `20` | Latches a halt when breached |
+| `MAX_TRADES_PER_DAY` | `10` | Daily trade cap |
+| `MAX_OPEN_POSITIONS` | `1` | Concurrency cap |
+| `COOLDOWN_SECONDS` | `120` | Minimum gap between entries |
+| `MIN_EDGE_CENTS` | `6` | Required edge vs fair value |
+| `MIN_CONFIDENCE` | `60` | Confidence floor |
+| `MAX_SPREAD_CENTS` | `6` | Skip wide books |
+| `MIN_BOOK_SIZE` | `20` | Required resting size |
+| `MIN_PRICE_CENTS` / `MAX_PRICE_CENTS` | `12` / `88` | Avoid the tails |
+| `MIN_SECONDS_TO_CLOSE` | `90` | No entries near settlement |
 
-## 4. Persistence
+The daily loss limit is measured against account balance, not a local tally, so
+open exposure and fees are included. A breach latches and survives restart; it
+clears at the next UTC day. A manual halt only clears via `/api/trader/resume`.
 
-Daily counters, the loss-cap halt and the decision log live in `DATA_DIR`
-(default `./data`). Railway's filesystem is ephemeral, so attach a **Volume**
-mounted at `/app/data` and set `DATA_DIR=/app/data`. Without it a restart
-resets the daily trade count and clears a latched halt.
+---
 
-## 5. Rollout sequence
+## Three decisions still yours
 
-1. Set credentials with `KALSHI_ENV=demo` and `TRADING_MODE=off`. Deploy.
-2. `GET /api/trader/selftest` with header `X-Admin-Token: <ADMIN_TOKEN>`.
-   It returns your balance if signing works.
-3. Set `TRADING_MODE=dryrun`. Watch `data/decisions.jsonl` and the `trader`
-   block on `/api/state`. Every `dry_run_intent` is an order the system would
-   have placed - compare them against what you would have approved.
-4. When the intents look right, `TRADING_MODE=live` with `KALSHI_ENV=demo`.
-   Same code path, paper money.
-5. Only then `KALSHI_ENV=prod`, at minimum size.
+These need your judgment, not a default:
 
-## Kill switch
+**1. Exit rule.** Positions currently hold to settlement — there is no early
+exit on a confidence reversal, no stop, no take-profit. For 15-minute binaries
+this is defensible, but it means every entry is committed. If you want early
+exits, that is a real addition and needs its own rules.
 
-```
-curl -X POST https://<your-app>/api/trader/halt   -H "X-Admin-Token: <ADMIN_TOKEN>"
-```
+**2. Sizing.** Fixed contract count, deliberately. Kelly sizing on an
+uncalibrated model sizes up on its own errors, so it should wait until the
+dry-run log shows the edge estimate is honest.
 
-Halt latches and survives restarts when a volume is attached. Resume with
-`/api/trader/resume`. Setting `TRADING_MODE=off` and redeploying is the
-heavier equivalent.
+**3. Strike parsing.** Confirm stage 1 resolves a strike against a real
+KXBTC15M market before trusting any signal.
 
-## What still needs your judgement
+---
 
-- **Exit rule.** Positions are currently held to settlement. If you want an
-  early exit on a confidence reversal, that is a deliberate addition.
-- **Sizing.** Fixed contract count, not Kelly. Proportional sizing needs a
-  calibrated win rate, which needs live history first.
-- **Strike detection.** `policy.extract_strike` reads `floor_strike` and
-  falls back to parsing the title. Confirm it resolves correctly against a
-  real market before going live; a wrong strike silently inverts the model.
+## Order endpoint
+
+`KALSHI_ORDER_PATH` defaults to `/portfolio/orders`. Kalshi also exposes a newer
+`/portfolio/events/orders` surface; if your account is provisioned for that one,
+set the variable rather than editing code.

@@ -1,158 +1,203 @@
+"""The autonomous loop.
+
+Three modes, set by TRADING_MODE:
+
+    off     evaluate nothing; the dashboard stays informational (default)
+    dryrun  run the full decision path and log every intended order, place none
+    live    place orders
+
+dryrun exercises the identical code path as live, so the decision log is a
+faithful preview of what live would have done.
 """
-The autonomous decision loop.
-
-One pass of `step()` is the whole cycle: read the current decision, ask the
-risk manager whether it is allowed, size it, and place it. Modes:
-
-    off     nothing is evaluated and nothing is placed
-    dryrun  everything is evaluated and logged, nothing is placed
-    live    orders are placed
-
-Dry-run is the important one. It exercises the identical code path an order
-would take and writes what it would have done to the decision log, so the
-policy can be compared against the judgement it is replacing before any money
-is committed.
-"""
-
-from __future__ import annotations
 
 import asyncio
+import os
 import time
-from typing import Any, Callable, Optional
+import uuid
 
-from kalshi_client import KalshiAuthError, KalshiClient, KalshiError
+import policy
+from kalshi_client import KalshiAuthError, KalshiClient, KalshiRequestError
+from risk import RiskManager
+
+POLL_SECONDS = 3
+RECONCILE_SECONDS = 30
+
+
+def mode():
+    value = os.getenv("TRADING_MODE", "off").strip().lower()
+    return value if value in ("off", "dryrun", "live") else "off"
 
 
 class Trader:
-    def __init__(
-        self,
-        *,
-        settings: Any,
-        client: KalshiClient,
-        risk: Any,
-        decide: Callable[[], dict],
-    ) -> None:
-        self.settings = settings
-        self.client = client
-        self.risk = risk
-        self.decide = decide
-        self.status: dict = {
-            "running": False,
-            "mode": settings.trading_mode,
-            "last_pass_at": None,
-            "last_action": None,
-            "last_block": None,
-            "last_error": None,
-            "orders_placed": 0,
-            "dry_run_intents": 0,
-            "account_synced_at": None,
-        }
+    def __init__(self, get_context):
+        """get_context() must return (spot, trades, market, orderbook)."""
+        self.get_context = get_context
+        self.client = KalshiClient()
+        self.risk = RiskManager()
+        self.mode = mode()
+        self.status = "idle"
+        self.last_error = None
+        self.last_evaluation = None
+        self.last_evaluated_at = None
+        self.last_order = None
+        self._reconciled_at = 0
 
-    # ---- account reconciliation ---------------------------------------
+    # ---------- reconciliation ----------
 
-    async def sync_account(self) -> None:
-        """Align local state with the broker before acting on it."""
-        if not self.client.can_trade:
-            return
-        try:
-            balance = await self.client.balance_cents()
-            self.risk.note_balance(balance)
-            positions = await self.client.positions()
-            self.risk.sync_positions(positions)
-            self.status["account_synced_at"] = int(time.time())
-            self.status["last_error"] = None
-        except KalshiAuthError as error:
-            self.status["last_error"] = f"auth: {error}"
-            self.risk.halt(f"Kalshi rejected the credentials: {error}")
-        except (KalshiError, Exception) as error:  # noqa: BLE001
-            self.status["last_error"] = str(error)[:200]
-
-    # ---- one decision cycle -------------------------------------------
-
-    async def step(self) -> None:
-        self.status["last_pass_at"] = int(time.time())
-
-        if not self.settings.is_enabled:
-            self.status["last_action"] = "disabled"
-            return
-
-        decision = self.decide()
-        self.status["last_action"] = decision.get("action")
-
-        if decision.get("action") == "NO TRADE":
-            self.status["last_block"] = None
-            return
-
-        block = self.risk.veto(decision)
-        if block:
-            self.status["last_block"] = block
-            self.risk.log_decision({"event": "blocked", "reason": block, "decision": decision})
-            return
-
-        count = self.risk.size_for(decision)
-        if count < 1:
-            self.status["last_block"] = "Size limits leave no contracts to buy"
-            self.risk.log_decision({"event": "blocked", "reason": "size zero", "decision": decision})
-            return
-
-        self.status["last_block"] = None
-
-        if not self.settings.is_live:
-            self.status["dry_run_intents"] += 1
-            self.risk.record_order(decision, count, live=False)
-            self.risk.log_decision(
-                {"event": "dry_run_intent", "count": count, "decision": decision}
-            )
+    async def reconcile(self):
+        """Pull the broker's truth into local state. Never trust local counters alone."""
+        if not self.client.configured:
             return
 
         try:
-            result = await self.client.create_order(
-                order_path=self.settings.order_path,
-                ticker=decision["ticker"],
-                side=decision["side"],
-                action="buy",
-                count=count,
-                price_cents=int(decision["price_cents"]),
-            )
-        except KalshiAuthError as error:
-            self.status["last_error"] = f"auth: {error}"
-            self.risk.halt(f"Kalshi rejected the credentials: {error}")
-            self.risk.log_decision({"event": "order_auth_error", "error": str(error)[:300]})
-            return
-        except Exception as error:  # noqa: BLE001
-            self.status["last_error"] = str(error)[:200]
-            self.risk.log_decision({"event": "order_error", "error": str(error)[:300]})
-            return
+            balance = await self.client.get_balance()
+            self.risk.observe_balance(balance.get("balance"))
 
-        self.status["orders_placed"] += 1
-        self.status["last_error"] = None
-        self.risk.record_order(decision, count, live=True)
-        self.risk.log_decision(
-            {
-                "event": "order_placed",
-                "count": count,
-                "decision": decision,
-                "order": result.get("order", result),
+            positions = await self.client.get_positions()
+            self.risk.observe_positions(positions.get("market_positions") or positions.get("positions"))
+
+            self._reconciled_at = time.time()
+            self.last_error = None
+        except KalshiAuthError as error:
+            self.last_error = f"auth: {error}"
+            self.risk.halt(f"authentication rejected: {str(error)[:120]}")
+        except KalshiRequestError as error:
+            self.last_error = f"reconcile: {str(error)[:160]}"
+
+    # ---------- execution ----------
+
+    async def place(self, signal, contracts):
+        client_order_id = f"btc15m-{uuid.uuid4().hex[:16]}"
+        ticker = signal["ticker"]
+        side = signal["side"]
+        price = int(round(signal["price_cents"]))
+
+        if self.mode == "dryrun":
+            record = {
+                "event": "dryrun_order",
+                "ticker": ticker,
+                "side": side,
+                "contracts": contracts,
+                "price_cents": price,
+                "client_order_id": client_order_id,
+                "signal": signal,
             }
-        )
-        await self.sync_account()
+            self.risk.log_decision(record)
+            self.risk.record_trade(ticker, contracts)
+            self.last_order = record
+            return record
 
-    # ---- loop ----------------------------------------------------------
+        try:
+            response = await self.client.create_order(
+                ticker=ticker,
+                action="buy",
+                side=side,
+                count=contracts,
+                limit_price_cents=price,
+                client_order_id=client_order_id,
+            )
+        except KalshiAuthError as error:
+            self.risk.halt(f"authentication rejected on order: {str(error)[:120]}")
+            self.risk.log_decision({"event": "order_auth_error", "error": str(error)[:300]})
+            self.last_error = f"auth: {error}"
+            return None
+        except KalshiRequestError as error:
+            self.risk.log_decision({
+                "event": "order_error",
+                "ticker": ticker,
+                "error": str(error)[:300],
+                "signal": signal,
+            })
+            self.last_error = f"order: {str(error)[:160]}"
+            return None
 
-    async def run(self) -> None:
-        self.status["running"] = True
-        await self.sync_account()
-        last_sync = time.time()
+        order = (response or {}).get("order") or {}
+        record = {
+            "event": "live_order",
+            "ticker": ticker,
+            "side": side,
+            "contracts": contracts,
+            "price_cents": price,
+            "client_order_id": client_order_id,
+            "order_id": order.get("order_id"),
+            "order_status": order.get("status"),
+            "signal": signal,
+        }
+        self.risk.log_decision(record)
+        self.risk.record_trade(ticker, contracts)
+        self.last_order = record
+
+        # Fold the fill into balance and position state immediately.
+        await self.reconcile()
+        return record
+
+    # ---------- loop ----------
+
+    async def step(self):
+        spot, trades, market, orderbook = self.get_context()
+        signal = policy.evaluate(spot, trades, market, orderbook)
+
+        self.last_evaluation = signal
+        self.last_evaluated_at = int(time.time())
+
+        if signal.get("action") == "NO TRADE":
+            self.status = "watching"
+            return
+
+        allowed, reason, contracts = self.risk.check(signal)
+
+        if not allowed:
+            self.status = f"blocked: {reason}"
+            self.risk.log_decision({
+                "event": "blocked",
+                "reason": reason,
+                "signal": signal,
+            })
+            return
+
+        self.status = f"placing {contracts} {signal['side']} @ {signal['price_cents']:.0f}c"
+        await self.place(signal, contracts)
+        self.status = "watching"
+
+    async def run(self):
+        if self.mode == "off":
+            self.status = "disabled (TRADING_MODE=off)"
+            return
+
+        if not self.client.configured:
+            self.status = "disabled (Kalshi credentials not set)"
+            self.last_error = "KALSHI_KEY_ID or KALSHI_PRIVATE_KEY is missing"
+            return
+
+        await self.reconcile()
+        self.status = "watching"
 
         while True:
             try:
-                await self.step()
-                if time.time() - last_sync > 30:
-                    await self.sync_account()
-                    last_sync = time.time()
-            except Exception as error:  # noqa: BLE001 - the loop must not die
-                self.status["last_error"] = str(error)[:200]
-            await asyncio.sleep(self.settings.loop_seconds)
+                if time.time() - self._reconciled_at > RECONCILE_SECONDS:
+                    await self.reconcile()
 
-    def public_view(self) -> dict:
-        return dict(self.status, mode=self.settings.trading_mode)
+                if not self.risk.state.get("halted"):
+                    await self.step()
+                else:
+                    self.status = f"halted: {self.risk.state.get('halt_reason')}"
+            except Exception as error:
+                self.last_error = f"loop: {str(error)[:200]}"
+                self.status = "error"
+
+            await asyncio.sleep(POLL_SECONDS)
+
+    # ---------- reporting ----------
+
+    def snapshot(self):
+        return {
+            "mode": self.mode,
+            "env": self.client.env,
+            "credentials_configured": self.client.configured,
+            "status": self.status,
+            "last_error": self.last_error,
+            "last_evaluated_at": self.last_evaluated_at,
+            "last_order": self.last_order,
+            "risk": self.risk.snapshot(),
+            "policy_limits": policy.limits(),
+        }
