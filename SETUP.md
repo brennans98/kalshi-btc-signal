@@ -1,131 +1,252 @@
-# Autonomous trading setup
+# Kalshi BTC 15m Scalper — setup
 
-The system ships inert. `TRADING_MODE=off` and `KALSHI_ENV=demo` are the
-defaults, so deploying this branch places no orders. Work through the stages in
-order; each one is verifiable before the next carries any risk.
+This is the operator's guide. Follow it in order; each stage exists to catch a
+specific class of mistake before money is involved.
 
-## Environment variables
+Safe by default: with no variables set beyond credentials, `TRADING_MODE` is
+`off` and `KALSHI_ENV` is `demo`. Deploying changes nothing about execution.
 
-Set these in Railway (Variables tab). Never commit them.
+---
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `TRADING_MODE` | `off` | `off` / `dryrun` / `live` |
-| `KALSHI_ENV` | `demo` | `demo` (paper) or `prod` (real money) |
-| `KALSHI_API_KEY_ID` | — | Key ID from Kalshi API settings |
-| `KALSHI_PRIVATE_KEY` | — | Full RSA private key PEM |
-| `ADMIN_TOKEN` | — | Secret for the selftest/halt/resume endpoints |
-| `KALSHI_SERIES_TICKER` | `KXBTC15M` | Market series to trade |
-| `RISK_STATE_PATH` | `data/risk_state.json` | Halt latch and daily counters |
-| `DECISION_LOG_PATH` | `data/decisions.jsonl` | Append-only decision log |
+## What the system does
 
-### Signal thresholds
+It scalps Kalshi's 15-minute BTC markets. It estimates a fair probability from
+live Coinbase trades, compares that against the Kalshi book, and enters when the
+ask is enough below fair value — then manages the exit on a three-rung ladder.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `MIN_EDGE_CENTS` | `3.0` | Required gap between fair value and the ask |
-| `MIN_CONFIDENCE` | `58` | Probability floor for the chosen side |
-| `MAX_SPREAD_CENTS` | `8` | Skip wider books |
-| `MIN_PRICE_CENTS` / `MAX_PRICE_CENTS` | `8` / `92` | Tradable price band |
-| `MIN_SECONDS_TO_CLOSE` | `75` | Do not enter near settlement |
-| `MAX_SECONDS_TO_CLOSE` | `900` | Trading window length |
+| Rung | Default target | Sells |
+|---|---|---|
+| small | +3¢ | 50% of the position |
+| medium | +7¢ | 30% |
+| large | +14¢ | 20% |
 
-### Risk limits
+And exits that are not profits: a **6¢ hard stop**, a **3¢ trailing stop** armed
+only after the small rung hits, a **5-minute max hold**, and a **90-second
+settlement guard** that flattens before expiry rather than accepting a coin flip.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `MAX_CONTRACTS_PER_TRADE` | `5` | Hard size cap |
-| `MAX_COST_PER_TRADE_CENTS` | `500` | $5.00 max per entry |
-| `MAX_OPEN_POSITIONS` | `1` | Concurrency cap |
-| `MAX_TRADES_PER_DAY` | `12` | Daily activity cap |
-| `DAILY_LOSS_LIMIT_CENTS` | `2000` | $20.00 drawdown then latched halt |
-| `COOLDOWN_SECONDS` | `60` | Minimum gap between entries |
+The guard is the important one. A 15-minute contract held to settlement is not a
+scalp — it resolves at 0 or 100. The guard sells while there is still a book.
 
-All of these are read per-evaluation, so changing one in Railway takes effect on
-the next loop iteration without a code change.
+---
 
-## Persist the state directory
+## Stage 1 — Railway variables
 
-The halt latch and the decision log are files. Railway's container filesystem is
-ephemeral — without a volume, a redeploy erases the log and, more importantly,
-clears a latched loss-limit halt. Attach a Railway volume mounted at `/app/data`
-before going live.
+Set these in your Railway service under Variables. **Never commit them.**
 
-## Stage 1 — confirm the signal is real
+### Required
 
-Deploy with `TRADING_MODE=off`. No credentials needed; the book and market data
-are public.
+| Variable | Value |
+|---|---|
+| `KALSHI_API_KEY_ID` | The key ID from Kalshi → Settings → API Keys |
+| `KALSHI_PRIVATE_KEY` | The full RSA private key, `-----BEGIN…` through `-----END…` |
+| `ADMIN_TOKEN` | A long random string you invent. Gates the admin endpoints. |
+| `DATA_DIR` | `/app/data` |
 
-Check `/api/state` and confirm:
+Paste the private key with real newlines if Railway's editor allows it; escaped
+`\n` sequences are handled too.
 
-- `kalshi.market_ticker` resolves to an active market
-- `kalshi.orderbook_at` is recent
-- `signal.confidence` moves off 0 and `signal.reason` reports real edge numbers
-- `signal.strike_source` reads `market.floor_strike`, not `ticker`
+### Attach a volume
 
-That last one matters most. If the strike is being parsed out of the ticker
-string rather than read from a field, verify the number against the market title
-before continuing — an inverted strike produces a confident wrong signal.
+Railway → your service → **Volumes** → mount at `/app/data`.
 
-## Stage 2 — verify credentials
+Without it, every restart wipes the daily loss counter, the trade count, a
+latched halt, and all open lot tracking. A restart mid-scalp would leave a real
+position with nothing managing its exit. This is not optional for live trading.
 
-Create an API key in Kalshi, set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY`,
-keep `KALSHI_ENV=demo`, then:
+---
+
+## Stage 2 — verify signing
+
+Deploy, then:
 
 ```
-curl -X POST https://<your-app>/admin/selftest -H "X-Admin-Token: <ADMIN_TOKEN>"
+curl -H "x-admin-token: YOUR_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/selftest
 ```
 
-`ok: true` with a balance means signing works. An `auth` error type means the
-key, the PEM formatting, or the environment is wrong. If the order endpoint
-path differs for your account, override it with `KALSHI_ORDER_PATH`.
+`"ok": true` with a balance means credentials and request signing work. An
+`auth` error means the key or key ID is wrong. Nothing is placed either way.
+
+Also check the dashboard: the signal should now show real confidence and
+specific reasons (`Edge 1.4¢ below the 2.0¢ minimum`) instead of a permanent
+`NO TRADE`.
+
+---
 
 ## Stage 3 — dry run, and actually read it
 
-Set `TRADING_MODE=dryrun`. The full path runs — signal, risk check, sizing — and
-logs the order it would have placed without sending anything.
-
-Let it run across a meaningful sample, then read `/api/decisions` and ask of
-each entry: *would I have approved this?*
-
-This is the stage that gets skipped, and it is the one that matters. The
-thresholds in this branch are placeholders chosen to be conservative, not
-calibrated to your judgment. Dry-run output is how you find out whether the
-numbers encode what you would have done — while disagreeing is still free.
-
-Adjust the thresholds and re-run until the log reads like your own decisions.
-
-## Stage 4 — live on demo
-
-Keep `KALSHI_ENV=demo`, set `TRADING_MODE=live`. Real order placement, paper
-money. Confirm orders appear in your Kalshi demo account, fills reconcile, and
-the daily counters increment. Trip the loss limit deliberately if you can — a
-halt you have never seen fire is not a halt you can rely on.
-
-## Stage 5 — live on production
-
-Set `KALSHI_ENV=prod` with production credentials, at minimum size. Leave
-`MAX_CONTRACTS_PER_TRADE` and `MAX_COST_PER_TRADE_CENTS` low until you have a
-real sample of live fills. Scale on evidence, not on the absence of a problem.
-
-## Kill switch
-
 ```
-curl -X POST https://<your-app>/admin/halt   -H "X-Admin-Token: <ADMIN_TOKEN>"
-curl -X POST https://<your-app>/admin/resume -H "X-Admin-Token: <ADMIN_TOKEN>"
+TRADING_MODE=dryrun
 ```
 
-A manual halt survives restarts and the UTC day boundary; it clears only via
-`/admin/resume`. An automatic loss-limit halt clears at the next UTC day.
-Setting `TRADING_MODE=off` in Railway also stops the loop on redeploy.
+This is a real simulation, not a logging stub. It opens paper lots, marks them
+against the live book every couple of seconds, and walks them through the same
+ladder, stops and guards — producing complete round trips with realized cents.
+Paper lots are kept in a separate file and never touch your account.
 
-## What this does not do
+Let it run across a few hours of real market conditions, then:
 
-- **No exits.** Positions are held to settlement. There is no stop-loss and no
-  early exit on signal reversal. For 15-minute binaries that is defensible, but
-  it means every entry is a committed decision.
-- **No sizing model.** Fixed contract count, deliberately. Kelly sizing on an
-  uncalibrated probability model scales up on its own estimation errors.
-- **No calibration tracking.** The model's stated probabilities are not yet
-  compared against realized settlement rates. Until they are, treat the
-  confidence number as an ordering signal, not a true probability.
+```
+curl -H "x-admin-token: YOUR_TOKEN" \
+  "https://YOUR-APP.up.railway.app/api/trader/decisions?limit=200"
+
+curl -H "x-admin-token: YOUR_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/scalps
+```
+
+What you are looking for, in order of importance:
+
+1. **Is the strike right?** Every entry logs `strike` and `strike_source`. If
+   `strike_source` is `ticker` rather than `market.floor_strike`, verify the
+   parsed number against the market title yourself. A wrong strike produces a
+   confident, inverted signal — the worst failure this system has.
+2. **Which rung is actually paying?** If `tier_hits` is all `small` and
+   `stop_exits` is high, the stop is too tight for the volatility, or the small
+   target is too close to the spread.
+3. **How often does the settlement guard fire?** Frequent guard exits mean
+   entries are happening too late in the contract's life — raise
+   `MIN_SECONDS_TO_CLOSE`.
+4. **Would you have approved these?** This is the real question. The limits
+   below are what replaced your approval click; the dry run is how you check
+   they encode your judgment.
+
+---
+
+## Stage 4 — live on demo money
+
+```
+TRADING_MODE=live
+KALSHI_ENV=demo
+```
+
+Same code path, real order placement, fake money. This catches what dry run
+cannot: actual fill behaviour, partial exits, and whether your limit prices get
+hit at all. Confirm real fills appear before continuing.
+
+---
+
+## Stage 5 — production, minimum size
+
+```
+KALSHI_ENV=prod
+MAX_CONTRACTS_PER_TRADE=1
+MAX_COST_PER_TRADE_CENTS=100
+DAILY_LOSS_LIMIT_CENTS=500
+```
+
+Stay here for a meaningful sample of round trips — dozens, not three. Scale only
+after the live numbers match what the dry run predicted.
+
+---
+
+## The kill switch
+
+```
+# stop new entries; open positions keep being managed
+curl -X POST -H "x-admin-token: YOUR_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/halt
+
+# stop entries AND sell everything at the current bid
+curl -X POST -H "x-admin-token: YOUR_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/flatten
+
+curl -X POST -H "x-admin-token: YOUR_TOKEN" \
+  https://YOUR-APP.up.railway.app/api/trader/resume
+```
+
+A halt stops **entries only** — exits keep running, because abandoning an open
+position is not a safety measure. Use `flatten` when you want out entirely; it
+works even with `TRADING_MODE=off`, which is the situation an emergency flatten
+exists for.
+
+A halt latches to disk. Restarting the container does not clear it. An automatic
+halt (loss limit, auth failure) clears at the next UTC day; a manual halt stays
+until you resume it.
+
+---
+
+## Every variable
+
+### Entry
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIN_EDGE_CENTS` | `2.0` | Minimum ask-vs-fair gap to enter |
+| `MIN_CONFIDENCE` | `55` | Confidence floor, percent |
+| `MAX_SPREAD_CENTS` | `4` | Skip wider books — the spread eats a scalp |
+| `MIN_EXIT_LIQUIDITY` | `25` | Contracts that must rest on the side you'll sell |
+| `MIN_PRICE_CENTS` | `15` | Avoid cheap tails |
+| `MAX_PRICE_CENTS` | `85` | Avoid expensive near-certainties |
+| `MIN_SECONDS_TO_CLOSE` | `180` | Minimum runway to bother entering |
+| `MAX_SECONDS_TO_CLOSE` | `900` | Don't enter before this much life remains |
+| `VOL_WINDOW_SECONDS` | `300` | Volatility estimation window |
+| `MIN_HISTORY_SECONDS` | `120` | Warm-up before any signal is issued |
+
+### The ladder
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCALP_SMALL_CENTS` | `3` | Small target |
+| `SCALP_SMALL_PCT` | `50` | Percent of original size sold there |
+| `SCALP_MEDIUM_CENTS` | `7` | Medium target |
+| `SCALP_MEDIUM_PCT` | `30` | |
+| `SCALP_LARGE_CENTS` | `14` | Large target |
+| `SCALP_LARGE_PCT` | `20` | |
+| `SCALP_STOP_CENTS` | `6` | Hard stop, cents against entry |
+| `SCALP_TRAIL_CENTS` | `3` | Trailing give-back, armed after the first rung |
+| `SCALP_MAX_HOLD_SECONDS` | `300` | Time exit |
+| `SCALP_SETTLEMENT_GUARD_SECONDS` | `90` | Flatten this long before close |
+| `SCALP_SMALL_LOT_EXIT_TIER` | `medium` | Where a 1–2 contract lot exits whole |
+
+The three percentages must total 100, and the three targets must increase. The
+app refuses to start the trader if they don't.
+
+### Risk
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_CONTRACTS_PER_TRADE` | `6` | Hard size ceiling |
+| `MAX_COST_PER_TRADE_CENTS` | `500` | Dollar ceiling per entry |
+| `DAILY_LOSS_LIMIT_CENTS` | `2000` | Breaching this latches a halt |
+| `MAX_TRADES_PER_DAY` | `40` | |
+| `MAX_OPEN_POSITIONS` | `2` | Concurrent scalps |
+| `COOLDOWN_SECONDS` | `20` | Gap between entries |
+
+The loss limit is measured against your actual Kalshi balance, not a local
+tally, so it accounts for open exposure and fees. Position size is also capped
+by resting exit liquidity — entering 6 against a 2-lot bid means the ladder
+cannot sell what it just bought.
+
+### Timing
+
+| Variable | Default |
+|---|---|
+| `TRADE_LOOP_SECONDS` | `2.0` |
+| `BOOK_POLL_SECONDS` | `2.0` |
+| `RECONCILE_SECONDS` | `30.0` |
+
+---
+
+## Decisions still worth making
+
+These are yours, and the defaults are guesses:
+
+1. **Ladder spacing.** `3/7/14¢` against a `6¢` stop is roughly break-even at a
+   50% hit rate on the small rung alone. Tighten or widen based on what the dry
+   run shows about actual travel.
+2. **Stop vs. spread.** The stop must exceed `MAX_SPREAD_CENTS`, or it triggers
+   on the spread before price moves. The app rejects a config where it doesn't.
+3. **Concurrency.** `MAX_OPEN_POSITIONS=2` on 15-minute markets means two
+   correlated bets on the same underlying. Treat it as a single risk.
+
+---
+
+## A caution worth stating plainly
+
+High-frequency scalping of short-dated binaries is unforgiving: fees and spread
+are paid on every round trip, and a 3¢ target against a 4¢ spread cap is a thin
+margin by construction. Nothing here has been validated against live fills —
+the dry run and demo stages exist precisely because the model's assumptions are
+unproven. Read Kalshi's API terms on automated trading before running in
+production, and size as though the system will be wrong more often than it is
+right.
