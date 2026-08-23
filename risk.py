@@ -18,6 +18,9 @@ Design notes:
     count per day is higher and the cooldown much shorter, because the whole
     point is many small round trips. The loss cap is what actually bounds the
     day, and it does not care how many trades produced the loss.
+  - The loss-limit check runs on every tick via check_halt(), independent of
+    whether a new entry signal exists. A quiet period with no BUY signals must
+    not let the account drift past the limit unnoticed while exits keep firing.
 """
 
 import json
@@ -48,6 +51,7 @@ def _blank_state():
         "day": _today(),
         "day_start_balance_cents": None,
         "trades_today": 0,
+        "cost_today_cents": 0,
         "last_trade_at": 0,
         "halted": False,
         "halt_reason": None,
@@ -62,177 +66,4 @@ def load_state():
     except Exception:
         state = _blank_state()
 
-    # A new UTC day resets counters and clears an automatic halt. A manual halt
-    # persists until it is explicitly resumed.
-    if state.get("day") != _today():
-        manual = state.get("halted") and state.get("halt_is_manual")
-        reason = state.get("halt_reason") if manual else None
-        state = _blank_state()
-        state["halted"] = bool(manual)
-        state["halt_reason"] = reason
-        state["halt_is_manual"] = bool(manual)
-        save_state(state)
-
-    return state
-
-
-def save_state(state):
-    try:
-        path = config.settings.risk_state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
-
-
-def log_decision(record):
-    record = dict(record)
-    record["logged_at"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        path = config.settings.decision_log_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
-
-
-def read_decisions(limit=50, event=None):
-    try:
-        lines = config.settings.decision_log_path.read_text().strip().splitlines()
-    except Exception:
-        return []
-
-    records = []
-    for line in reversed(lines):
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if event and record.get("event") != event:
-            continue
-        records.append(record)
-        if len(records) >= limit:
-            break
-
-    return records
-
-
-def is_halted():
-    return bool(load_state().get("halted"))
-
-
-def halt(reason, manual=False):
-    state = load_state()
-    state["halted"] = True
-    state["halt_reason"] = reason
-    state["halt_is_manual"] = manual
-    save_state(state)
-    log_decision({"event": "halt", "reason": reason, "manual": manual})
-    return state
-
-
-def resume():
-    state = load_state()
-    state["halted"] = False
-    state["halt_reason"] = None
-    state["halt_is_manual"] = False
-    save_state(state)
-    log_decision({"event": "resume"})
-    return state
-
-
-def note_balance(balance_cents):
-    """Record the day's opening balance the first time a balance is observed."""
-    if balance_cents is None:
-        return load_state()
-
-    state = load_state()
-    if state.get("day_start_balance_cents") is None:
-        state["day_start_balance_cents"] = int(balance_cents)
-        save_state(state)
-
-    return state
-
-
-def drawdown_cents(balance_cents):
-    state = load_state()
-    opening = state.get("day_start_balance_cents")
-
-    if opening is None or balance_cents is None:
-        return None
-
-    return max(0, opening - int(balance_cents))
-
-
-def record_trade(ticker, count, cost_cents):
-    state = load_state()
-    state["trades_today"] = int(state.get("trades_today", 0)) + 1
-    state["last_trade_at"] = int(time.time())
-
-    tickers = list(state.get("tickers_traded", []))
-    if ticker not in tickers:
-        tickers.append(ticker)
-    state["tickers_traded"] = tickers[-50:]
-
-    save_state(state)
-    return state
-
-
-def check(signal, balance_cents, open_position_count, open_tickers):
-    """Decide whether an ENTRY may be executed.
-
-    Exits are never routed through here; see the module docstring.
-    Returns (approved: bool, reason: str, sizing: dict|None).
-    """
-    cfg = config.settings
-    state = load_state()
-
-    if state.get("halted"):
-        return False, f"Trading halted: {state.get('halt_reason')}", None
-
-    drawdown = drawdown_cents(balance_cents)
-    if drawdown is not None and drawdown >= cfg.daily_loss_limit_cents:
-        halt(
-            f"Daily loss limit reached (down {drawdown}c of "
-            f"{cfg.daily_loss_limit_cents}c allowed)"
-        )
-        return False, "Daily loss limit reached", None
-
-    if state.get("trades_today", 0) >= cfg.max_trades_per_day:
-        return False, f"Daily trade cap reached ({cfg.max_trades_per_day})", None
-
-    if open_position_count >= cfg.max_open_positions:
-        return False, f"Open position cap reached ({cfg.max_open_positions})", None
-
-    ticker = signal.get("ticker")
-    if ticker and ticker in (open_tickers or []):
-        return False, f"Already scalping {ticker}", None
-
-    elapsed = time.time() - float(state.get("last_trade_at") or 0)
-    if elapsed < cfg.cooldown_seconds:
-        return False, f"Cooldown active ({int(cfg.cooldown_seconds - elapsed)}s remaining)", None
-
-    price = int(signal.get("price_cents") or 0)
-    if price <= 0:
-        return False, "Signal carries no executable price", None
-
-    count = min(
-        cfg.max_contracts_per_trade,
-        cfg.max_cost_per_trade_cents // price,
-    )
-
-    if balance_cents is not None:
-        count = min(count, int(balance_cents) // price)
-
-    # Never size beyond what the exit side can absorb. Entering 6 contracts
-    # against a 2-lot bid means the ladder cannot sell what it just bought.
-    exit_size = signal.get("exit_bid_size")
-    if isinstance(exit_size, int) and exit_size > 0:
-        count = min(count, exit_size)
-
-    if count < 1:
-        return False, "Cost cap, balance, or exit liquidity allows fewer than 1 contract", None
-
-    return True, "Within limits", {"count": count, "cost_cents": count * price}
+    # A new UTC day resets counters and clear
