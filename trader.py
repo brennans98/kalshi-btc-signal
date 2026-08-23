@@ -1,24 +1,20 @@
-"""The autonomous scalping loop.
-
-Order of operations on every tick, and the order matters:
-
-    1. exits   -- manage what is already open
-    2. entries -- only then consider opening something new
-
-Exits run first and unconditionally. A cooldown, a daily trade cap, or a
-latched halt blocks new entries; none of them may block closing a position the
-system already holds. A system that can open but not close is worse than one
-that does nothing.
+"""The autonomous loop.
 
 Three modes, set by TRADING_MODE:
-    off     evaluate nothing, place nothing (default)
-    dryrun  full decision path, including simulated round trips through the
-            ladder, placing nothing
+    off     signal only, no decision path exercised (default)
+    dryrun  full decision path incl. simulated round trips, places nothing
     live    places real orders
 
-dryrun exists because the honest test of an autonomous scalper is not whether
-it runs, but whether the round trips it produces are ones you would have taken.
-It writes to a separate lot file, so paper scalps never mix with live ones.
+Ordering inside a tick is deliberate: exits first, then entries. A tick that
+entered before exiting could open a new scalp while an existing one sat past its
+stop. Exits also bypass the entry gates entirely -- cooldowns and daily caps
+must never be able to trap an open position.
+
+dryrun exists because the honest test of an autonomous policy is not whether it
+runs, but whether you would have approved what it chose. It simulates complete
+round trips -- entry, each ladder rung, stops, timeouts -- against real book
+prices, writing to a paper lot file separate from live. Read the log, check the
+choices against your own judgment, then decide about live.
 
 Balance and positions are reconciled against Kalshi rather than tracked purely
 locally, so a restart or a missed fill cannot leave the loop believing it is
@@ -43,7 +39,7 @@ status = {
     "last_exit": None,
     "last_error": None,
     "balance_cents": None,
-    "open_positions": [],
+    "broker_positions": [],
     "reconciled_at": None,
 }
 
@@ -53,15 +49,17 @@ def mode():
 
 
 def _order_id(prefix):
-    return f"{prefix}-{uuid.uuid4().hex[:14]}"
+    return f"{prefix}-{uuid.uuid4().hex[:16]}"
 
 
 def snapshot():
+    """Everything the dashboard needs about the trader."""
+    current_mode = mode()
     state = risk.load_state()
-    current = mode()
 
     payload = dict(status)
-    payload["mode"] = current
+    payload["mode"] = current_mode
+    payload["enabled"] = config.settings.is_enabled
     payload["limits"] = risk.limits()
     payload["halted"] = bool(state.get("halted"))
     payload["halt_reason"] = state.get("halt_reason")
@@ -69,7 +67,7 @@ def snapshot():
     payload["trades_today"] = state.get("trades_today", 0)
     payload["day_start_balance_cents"] = state.get("day_start_balance_cents")
     payload["drawdown_cents"] = risk.drawdown_cents(status.get("balance_cents"))
-    payload["scalp"] = scalp.view(current if current != "off" else "dryrun")
+    payload["scalp"] = scalp.view(current_mode if current_mode != "off" else "dryrun")
     return payload
 
 
@@ -87,7 +85,7 @@ async def reconcile(client):
         if quantity:
             open_positions.append({"ticker": entry.get("ticker"), "position": quantity})
 
-    status["open_positions"] = open_positions
+    status["broker_positions"] = open_positions
     status["reconciled_at"] = int(time.time())
     return open_positions
 
@@ -95,118 +93,149 @@ async def reconcile(client):
 # ---------------------------------------------------------------- exits
 
 
-async def manage_exits(client, book_provider):
-    """Walk every open lot and act on whatever the ladder says.
+async def _exit_lot(client, lot, intent, dry):
+    """Execute one exit intent. Returns a log-shaped result dict."""
+    current_mode = mode()
+    ticker, side = lot["ticker"], lot["side"]
+    count, price = intent["count"], intent["limit_price"]
 
-    book_provider(ticker) returns the current orderbook payload, or None.
+    record = {
+        "event": "exit",
+        "mode": current_mode,
+        "tier": intent["tier"],
+        "kind": intent["kind"],
+        "ticker": ticker,
+        "side": side,
+        "count": count,
+        "limit_price_cents": price,
+        "entry_price_cents": lot["entry_price"],
+        "reason": intent["reason"],
+    }
+
+    if dry:
+        realized = scalp.record_exit(
+            current_mode, lot["key"], intent["tier"], intent["kind"], count, price
+        )
+        record["outcome"] = "simulated"
+        record["realized_cents"] = realized
+        risk.log_decision(record)
+        status["last_exit"] = {
+            "outcome": "simulated",
+            "reason": f"{intent['reason']} - sold {count} {side} @ {price}c",
+            "at": int(time.time()),
+        }
+        return record
+
+    try:
+        response = await client.sell(
+            ticker=ticker,
+            side=side,
+            count=count,
+            price_cents=price,
+            client_order_id=_order_id(f"exit-{intent['tier']}"),
+        )
+    except KalshiAuthError as error:
+        risk.halt(f"Authentication rejected while exiting {ticker}: {error}")
+        record["outcome"] = "auth_error"
+        record["error"] = str(error)
+        status["last_error"] = str(error)
+        risk.log_decision(record)
+        raise
+    except KalshiApiError as error:
+        # Leave the lot open: the ladder re-offers on the next tick.
+        record["outcome"] = "order_error"
+        record["error"] = str(error)
+        status["last_error"] = str(error)
+        risk.log_decision(record)
+        return record
+
+    realized = scalp.record_exit(
+        current_mode, lot["key"], intent["tier"], intent["kind"], count, price
+    )
+    record["outcome"] = "placed"
+    record["realized_cents"] = realized
+    record["response"] = response
+    risk.log_decision(record)
+
+    status["last_exit"] = {
+        "outcome": "placed",
+        "reason": f"{intent['reason']} - sold {count} {side} @ {price}c",
+        "at": int(time.time()),
+    }
+    return record
+
+
+async def manage_open_scalps(client, dry):
+    """Mark every open lot and act on whatever the ladder says.
+
+    Exits are not gated by risk.check(). A cooldown or daily cap that could
+    block closing a position would turn a risk control into a risk.
     """
-    current = mode()
-    exits = []
+    current_mode = mode()
+    acted = 0
 
-    for lot in scalp.open_lots(current):
-        book = book_provider(lot["ticker"])
-        snap = policy.book_snapshot(book)
-        bid = policy.bid_for_side(snap, lot["side"])
-
-        if bid is None:
+    for lot in scalp.open_lots(current_mode):
+        try:
+            book = await client.get_orderbook(lot["ticker"])
+        except KalshiApiError as error:
+            status["last_error"] = f"Book unavailable for {lot['ticker']}: {error}"
             continue
 
-        marked = scalp.mark(current, lot["key"], bid)
+        snapshot_book = policy.book_snapshot(book)
+        bid = policy.bid_for_side(snapshot_book, lot["side"])
+
+        if bid is None:
+            # No bid to sell into. Nothing to do but wait for one; the
+            # settlement guard will still fire once it can.
+            continue
+
+        marked = scalp.mark(current_mode, lot["key"], bid)
         if not marked:
             continue
 
         for intent in scalp.plan(marked, bid):
-            record = {
-                "event": "exit",
-                "mode": current,
-                "ticker": marked["ticker"],
-                "side": marked["side"],
-                "tier": intent["tier"],
-                "kind": intent["kind"],
-                "count": intent["count"],
-                "limit_price_cents": intent["limit_price"],
-                "entry_price_cents": marked["entry_price"],
-                "reason": intent["reason"],
-            }
+            await _exit_lot(client, marked, intent, dry)
+            acted += 1
+            marked = scalp.get(current_mode, lot["key"])
+            if not marked or (marked.get("count_open") or 0) <= 0:
+                break
 
-            if current == "dryrun":
-                realized = scalp.record_exit(
-                    current,
-                    marked["key"],
-                    intent["tier"],
-                    intent["kind"],
-                    intent["count"],
-                    intent["limit_price"],
-                )
-                record["outcome"] = "dryrun"
-                record["realized_cents"] = realized
-                risk.log_decision(record)
-                exits.append(record)
-                status["last_exit"] = record
-                continue
+    if acted:
+        scalp.forget_closed(current_mode)
 
-            try:
-                response = await client.sell(
-                    ticker=marked["ticker"],
-                    side=marked["side"],
-                    count=intent["count"],
-                    price_cents=intent["limit_price"],
-                    client_order_id=_order_id(f"exit-{intent['tier']}"),
-                )
-            except KalshiAuthError as error:
-                risk.halt(f"Authentication rejected while exiting: {error}")
-                record["outcome"] = "auth_error"
-                record["error"] = str(error)
-                status["last_error"] = str(error)
-                risk.log_decision(record)
-                raise
-            except KalshiApiError as error:
-                # Leave the lot open and retry on the next tick; the ladder is
-                # re-evaluated from scratch every time.
-                record["outcome"] = "exit_error"
-                record["error"] = str(error)
-                status["last_error"] = str(error)
-                risk.log_decision(record)
-                continue
-
-            realized = scalp.record_exit(
-                current,
-                marked["key"],
-                intent["tier"],
-                intent["kind"],
-                intent["count"],
-                intent["limit_price"],
-            )
-            record["outcome"] = "placed"
-            record["realized_cents"] = realized
-            record["response"] = response
-            risk.log_decision(record)
-            exits.append(record)
-            status["last_exit"] = record
-
-    if exits:
-        scalp.forget_closed(current)
-
-    return exits
+    return acted
 
 
 # --------------------------------------------------------------- entries
 
 
-async def consider_entry(client, signal, market):
-    current = mode()
+def _open_exposure(current_mode):
+    """Open positions as the entry gate should see them.
 
-    if not signal.get("action", "").startswith("BUY"):
+    In dryrun the broker holds no paper position, so paper lots are the only
+    truth. In live, lots and broker positions should agree; the larger of the
+    two is used so a missed fill cannot understate exposure.
+    """
+    lots = scalp.open_lots(current_mode)
+    lot_tickers = [lot["ticker"] for lot in lots]
+
+    if current_mode != "live":
+        return len(lots), lot_tickers
+
+    broker = status.get("broker_positions") or []
+    broker_tickers = [entry["ticker"] for entry in broker]
+    tickers = list(dict.fromkeys(lot_tickers + broker_tickers))
+    return max(len(lots), len(broker)), tickers
+
+
+async def consider_entry(client, signal, market, dry):
+    current_mode = mode()
+
+    if not str(signal.get("action", "")).startswith("BUY"):
         status["last_decision"] = {"outcome": "no_signal", "reason": signal.get("reason")}
         return
 
-    # Local lots are the authority on what this system is scalping; the
-    # reconciled account view catches anything opened outside it.
-    local_lots = scalp.open_lots(current)
-    local_tickers = [lot["ticker"] for lot in local_lots]
-    account_tickers = [entry["ticker"] for entry in (status.get("open_positions") or [])]
-    open_tickers = list({*local_tickers, *account_tickers})
-    open_count = max(len(local_lots), len(status.get("open_positions") or []))
+    open_count, open_tickers = _open_exposure(current_mode)
 
     approved, reason, sizing = risk.check(
         signal, status.get("balance_cents"), open_count, open_tickers
@@ -214,7 +243,7 @@ async def consider_entry(client, signal, market):
 
     record = {
         "event": "entry",
-        "mode": current,
+        "mode": current_mode,
         "approved": approved,
         "risk_reason": reason,
         "signal": signal,
@@ -231,28 +260,26 @@ async def consider_entry(client, signal, market):
     side = signal["side"]
     price = int(signal["price_cents"])
     count = sizing["count"]
-    close_epoch = policy.close_epoch(market)
+    close_at = policy.close_epoch(market)
 
-    if current == "dryrun":
-        scalp.record_entry(current, ticker, side, count, price, close_epoch)
-        record["outcome"] = "dryrun"
-        record["would_place"] = {
-            "ticker": ticker,
-            "side": side,
-            "count": count,
-            "limit_price_cents": price,
-            "cost_cents": sizing["cost_cents"],
-            "targets": signal.get("scalp_targets"),
-            "stop_cents": signal.get("stop_price_cents"),
+    ladder = {
+        tier.name: {"target_cents": price + tier.cents, "exit_pct": tier.pct}
+        for tier in config.settings.tiers()
+    }
+    record["ladder"] = ladder
+
+    if dry:
+        scalp.record_entry(current_mode, ticker, side, count, price, close_at)
+        risk.record_trade(ticker, count, sizing["cost_cents"])
+        record["outcome"] = "simulated"
+        status["last_entry"] = {
+            "outcome": "simulated",
+            "reason": f"Would buy {count} {side} @ {price}c on {ticker}",
+            "at": int(time.time()),
         }
-        status["last_decision"] = {
-            "outcome": "dryrun",
-            "reason": f"Would scalp {count} {side} @ {price}c on {ticker}",
-        }
+        status["last_decision"] = status["last_entry"]
         risk.log_decision(record)
         return
-
-    client_order_id = _order_id("entry")
 
     try:
         response = await client.create_order(
@@ -260,7 +287,7 @@ async def consider_entry(client, signal, market):
             side=side,
             count=count,
             price_cents=price,
-            client_order_id=client_order_id,
+            client_order_id=_order_id("entry"),
             action="buy",
         )
     except KalshiAuthError as error:
@@ -268,6 +295,7 @@ async def consider_entry(client, signal, market):
         record["outcome"] = "auth_error"
         record["error"] = str(error)
         status["last_error"] = str(error)
+        status["last_decision"] = {"outcome": "auth_error", "reason": str(error)}
         risk.log_decision(record)
         raise
     except KalshiApiError as error:
@@ -278,75 +306,79 @@ async def consider_entry(client, signal, market):
         risk.log_decision(record)
         return
 
-    # Trust the fill count the venue reports over the count requested.
-    order = (response or {}).get("order") or {}
-    filled = order.get("filled_count")
-    if not isinstance(filled, int) or filled <= 0:
-        filled = count
-
-    risk.record_trade(ticker, filled, filled * price)
-    scalp.record_entry(current, ticker, side, filled, price, close_epoch)
+    # Fill-or-kill: a response without a resting/filled order means no position.
+    scalp.record_entry(current_mode, ticker, side, count, price, close_at)
+    risk.record_trade(ticker, count, sizing["cost_cents"])
 
     record["outcome"] = "placed"
-    record["client_order_id"] = client_order_id
-    record["filled_count"] = filled
     record["response"] = response
     status["last_entry"] = {
-        "ticker": ticker,
-        "side": side,
-        "count": filled,
-        "limit_price_cents": price,
-        "targets": signal.get("scalp_targets"),
-        "placed_at": int(time.time()),
-    }
-    status["last_decision"] = {
         "outcome": "placed",
-        "reason": f"Scalping {filled} {side} @ {price}c on {ticker}",
+        "reason": f"Bought {count} {side} @ {price}c on {ticker}",
+        "at": int(time.time()),
     }
+    status["last_decision"] = status["last_entry"]
     risk.log_decision(record)
 
     try:
         await reconcile(client)
-    except Exception:
+    except (KalshiApiError, KalshiAuthError):
         pass
 
 
 # ------------------------------------------------------------------ loop
 
 
-async def tick(client, signal_provider, market_provider, book_provider):
+async def tick(client, context, dry):
     status["last_evaluated_at"] = int(time.time())
 
-    # Exits first, always.
-    await manage_exits(client, book_provider)
-    await consider_entry(client, signal_provider(), market_provider())
+    # Exits before entries, always.
+    await manage_open_scalps(client, dry)
+
+    if risk.is_halted():
+        status["last_decision"] = {
+            "outcome": "halted",
+            "reason": risk.load_state().get("halt_reason"),
+        }
+        return
+
+    await consider_entry(client, context.get("signal") or {}, context.get("market"), dry)
 
 
-async def loop(client, signal_provider, market_provider, book_provider):
-    if mode() == "off":
+async def loop(client, context_provider):
+    """Run the decision loop. context_provider() returns {signal, market}."""
+    cfg = config.settings
+
+    if not cfg.is_enabled:
         status["running"] = False
         return
 
     if not client.has_credentials:
         status["running"] = False
         status["last_error"] = (
-            f"Trading mode is '{mode()}' but credentials are unusable: "
+            f"Trading mode is '{cfg.trading_mode}' but credentials are unusable: "
             f"{client.credential_error}"
         )
+        return
+
+    problems = cfg.problems()
+    if problems:
+        status["running"] = False
+        status["last_error"] = "Configuration invalid: " + "; ".join(problems)
         return
 
     status["running"] = True
     last_reconcile = 0.0
 
     while True:
-        cfg = config.settings
+        dry = not config.settings.is_live
 
         try:
-            if time.time() - last_reconcile > cfg.reconcile_seconds:
+            if time.time() - last_reconcile > config.settings.reconcile_seconds:
                 await reconcile(client)
                 last_reconcile = time.time()
 
-            await tick(client, signal_provider, market_provider, book_provider)
+            await tick(client, context_provider(), dry)
             status["last_error"] = None
 
         except KalshiAuthError as error:
@@ -358,4 +390,4 @@ async def loop(client, signal_provider, market_provider, book_provider):
         except Exception as error:
             status["last_error"] = str(error)[:200]
 
-        await asyncio.sleep(cfg.loop_seconds)
+        await asyncio.sleep(config.settings.loop_seconds)
