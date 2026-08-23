@@ -11,7 +11,6 @@ import time
 from collections import deque
 from pathlib import Path
 
-import httpx
 import websockets
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -22,7 +21,7 @@ import policy
 import risk
 import scalp
 import trader
-from kalshi_client import KalshiApiError, KalshiClient
+from kalshi_client import KalshiApiError, KalshiAuthError, KalshiClient
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -69,12 +68,14 @@ def pct_move(seconds_ago):
     return ((trades[-1][1] - earlier) / earlier) * 100
 
 
+# The trader takes two providers rather than one combined object, so the signal
+# and the market can each be read at the moment it is needed.
 def current_signal():
     return policy.evaluate(list(trades), state["market"], state["orderbook"])
 
 
-def trader_context():
-    return {"signal": current_signal(), "market": state["market"]}
+def current_market():
+    return state["market"]
 
 
 def api_payload():
@@ -215,8 +216,6 @@ async def orderbook_worker():
             state["orderbook"] = await client.get_orderbook(ticker)
             state["book_error"] = None
             state["book_updated_at"] = int(time.time())
-        except KalshiApiError as error:
-            state["book_error"] = str(error)[:180]
         except Exception as error:
             state["book_error"] = str(error)[:180]
 
@@ -230,7 +229,12 @@ async def startup():
     asyncio.create_task(orderbook_worker())
 
     if config.settings.is_enabled:
-        asyncio.create_task(trader.loop(client, trader_context))
+        asyncio.create_task(trader.loop(client, current_signal, current_market))
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await client.aclose()
 
 
 # ------------------------------------------------------------- routes
@@ -295,38 +299,66 @@ async def api_resume(x_admin_token: str = Header(default="")):
 
 @app.post("/api/trader/flatten")
 async def api_flatten(x_admin_token: str = Header(default="")):
-    """Halt, then close every open scalp at the current bid."""
+    """Halt entries, then sell every open scalp at the current bid.
+
+    Deliberately works even when TRADING_MODE is "off": a position left over
+    from an earlier live session is exactly what an emergency flatten needs to
+    be able to reach.
+    """
     require_admin(x_admin_token)
     risk.halt("Flattened manually via API", manual=True)
 
-    closed = []
-    current_mode = config.settings.trading_mode
-    dry = not config.settings.is_live
+    lot_mode = config.settings.trading_mode
+    if lot_mode == "off":
+        lot_mode = "live"
 
-    for lot in scalp.open_lots(current_mode):
+    closed = []
+
+    for lot in scalp.open_lots(lot_mode):
         try:
             book = await client.get_orderbook(lot["ticker"])
-        except Exception as error:
-            closed.append({"ticker": lot["ticker"], "error": str(error)[:120]})
+        except (KalshiApiError, KalshiAuthError) as error:
+            closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
             continue
 
         bid = policy.bid_for_side(policy.book_snapshot(book), lot["side"])
         if bid is None:
-            closed.append({"ticker": lot["ticker"], "error": "no resting bid"})
+            closed.append(
+                {"ticker": lot["ticker"], "error": "no resting bid to sell into"}
+            )
             continue
 
-        marked = scalp.mark(current_mode, lot["key"], bid)
+        marked = scalp.mark(lot_mode, lot["key"], bid)
+        if not marked:
+            continue
+
+        wanted = marked["count_open"]
         intent = {
             "tier": "manual",
             "kind": "time",
-            "count": marked["count_open"],
+            "count": wanted,
             "limit_price": max(1, min(99, int(round(bid)))),
             "reason": "Manual flatten via API",
         }
-        result = await trader._exit_lot(client, marked, intent, dry)
-        closed.append({"ticker": lot["ticker"], "outcome": result.get("outcome")})
 
-    return {"halted": True, "closed": closed}
+        try:
+            await trader._execute_exit(client, lot_mode, marked, intent)
+        except (KalshiApiError, KalshiAuthError) as error:
+            closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
+            continue
+
+        remaining = (scalp.get(lot_mode, lot["key"]) or {}).get("count_open") or 0
+        closed.append(
+            {
+                "ticker": lot["ticker"],
+                "side": lot["side"],
+                "sold": wanted - remaining,
+                "price_cents": intent["limit_price"],
+                "still_open": remaining,
+            }
+        )
+
+    return {"halted": True, "mode": lot_mode, "closed": closed}
 
 
 @app.get("/api/trader/decisions")
@@ -338,9 +370,8 @@ async def api_decisions(limit: int = 50, x_admin_token: str = Header(default="")
 @app.get("/api/trader/scalps")
 async def api_scalps(x_admin_token: str = Header(default="")):
     require_admin(x_admin_token)
-    mode = config.settings.trading_mode
     return {
         "live": scalp.view("live"),
         "dryrun": scalp.view("dryrun"),
-        "active_mode": mode,
+        "active_mode": config.settings.trading_mode,
     }
