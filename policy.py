@@ -155,24 +155,32 @@ def taker_fee_cents(count, price_cents):
 
 
 def maker_fee_cents(count, price_cents):
-    """Resting/limit orders that provide liquidity pay roughly half the taker fee."""
-    return taker_fee_cents(count, price_cents) * 0.5
+    """Fee for a resting (maker) fill.
+
+    Kalshi's fee schedule applies a per-series maker multiplier to the taker
+    formula. For KXBTC15M the multiplier is 0: resting orders trade free.
+    MAKER_FEE_MULT exists so a future fee change is a config edit, not a
+    code change.
+    """
+    return taker_fee_cents(count, price_cents) * config.settings.maker_fee_multiplier
 
 
-def round_trip_fee_cents(count, entry_price_cents, exit_price_cents, entry_is_maker=False):
+def leg_fee_cents(count, price_cents, is_maker):
+    return maker_fee_cents(count, price_cents) if is_maker else taker_fee_cents(count, price_cents)
+
+
+def round_trip_fee_cents(
+    count, entry_price_cents, exit_price_cents, entry_is_maker=False, exit_is_maker=False
+):
     """Fee is charged on both the entry fill and the exit fill.
 
-    Entries in this system are fill-or-kill limit orders crossing the ask, so
-    they are takers. Exits are immediate-or-cancel limit orders selling into
-    the bid, also takers. If either leg is later changed to a resting maker
-    order, pass entry_is_maker=True to reflect the discount.
+    Which side of each leg we are on is a configuration choice (ENTRY_STYLE /
+    EXIT_STYLE). Maker legs use the series' maker multiplier; taker legs pay
+    the full published formula. Stops always cross as takers regardless of
+    EXIT_STYLE, so a conservative caller can price the exit leg as taker.
     """
-    entry_fee = (
-        maker_fee_cents(count, entry_price_cents)
-        if entry_is_maker
-        else taker_fee_cents(count, entry_price_cents)
-    )
-    exit_fee = taker_fee_cents(count, exit_price_cents)
+    entry_fee = leg_fee_cents(count, entry_price_cents, entry_is_maker)
+    exit_fee = leg_fee_cents(count, exit_price_cents, exit_is_maker)
     return entry_fee + exit_fee
 
 
@@ -334,8 +342,19 @@ def evaluate(trades, market, orderbook):
 
     count_estimate = max(1, cfg.max_contracts_per_trade)
     est_exit_price = exit_bid if exit_bid is not None else ask
-    fee_cents_total = round_trip_fee_cents(count_estimate, ask, est_exit_price)
+    entry_is_maker = cfg.entry_style == "maker"
+    exit_is_maker = cfg.exit_style == "maker"
+    fee_cents_total = round_trip_fee_cents(
+        count_estimate, ask, est_exit_price, entry_is_maker, exit_is_maker
+    )
     fee_cents_per_contract = fee_cents_total / count_estimate
+
+    # The price a maker entry would rest at: join our side's bid, improved by
+    # up to maker_improve_cents for queue priority, but never locking or
+    # crossing the book (post-only would reject that anyway).
+    maker_entry_price = None
+    if exit_bid is not None:
+        maker_entry_price = max(1, min(exit_bid + cfg.maker_improve_cents, ask - 1))
 
     diagnostics = {
         "side": side,
@@ -353,6 +372,7 @@ def evaluate(trades, market, orderbook):
         "seconds_to_close": int(remaining),
         "expected_move_cents": None if move is None else round(move, 2),
         "fee_cents_per_contract": round(fee_cents_per_contract, 2),
+        "maker_entry_price_cents": maker_entry_price,
         "scalp_targets": {
             tier.name: min(99, ask + tier.cents) for tier in tiers
         },
