@@ -140,6 +140,484 @@ async def _basis_from_fills(client, ticker, side, count):
     return None, "unavailable"
 
 
+# ---- maker entries ---------------------------------------------------------
+# A maker entry rests a post-only bid instead of crossing the spread. Nothing
+# is recorded as a position until Kalshi reports fills; the resting order
+# lives in scalp's "pending" store so a restart keeps polling it, and every
+# order carries an expiration_time so nothing can be forgotten on the book.
+
+
+def _record_pending_fills(pending_key, pending, filled_total):
+    """Turn newly observed fills on a resting entry into lot contracts."""
+    recorded = int(pending.get("filled_recorded") or 0)
+    new_fill = filled_total - recorded
+    if new_fill <= 0:
+        return 0
+
+    price = int(pending["price_cents"])
+    scalp.record_entry(
+        "live",
+        pending["ticker"],
+        pending["side"],
+        new_fill,
+        price,
+        pending.get("close_epoch"),
+    )
+    pending["filled_recorded"] = filled_total
+
+    if not pending.get("trade_counted"):
+        # One resting order is one trade for pacing purposes (cooldown, daily
+        # cap), counted when its first contract lands. Later partial fills
+        # extend the same lot at the same price.
+        risk.record_trade(pending["ticker"], filled_total, filled_total * price)
+        pending["trade_counted"] = True
+
+    scalp.pending_put("live", pending_key, pending)
+
+    risk.log_decision(
+        {
+            "event": "entry",
+            "mode": "live",
+            "outcome": "opened",
+            "signal": {
+                "ticker": pending["ticker"],
+                "side": pending["side"],
+                "price_cents": price,
+                "reason": "Resting maker entry filled (zero fee)",
+            },
+            "sizing": {"count": new_fill},
+            "filled_total": filled_total,
+            "order_count": pending.get("count"),
+        }
+    )
+
+    status["last_entry"] = {
+        "ticker": pending["ticker"],
+        "side": pending["side"],
+        "count": filled_total,
+        "price_cents": price,
+        "maker": True,
+        "simulated": False,
+        "at": int(time.time()),
+    }
+    status["last_decision"] = {
+        "outcome": "opened",
+        "reason": (
+            f"Maker entry filled {filled_total}/{pending.get('count')} "
+            f"{pending['side']} @ {price}c on {pending['ticker']}"
+        ),
+    }
+    return new_fill
+
+
+async def _poll_pending_entries(client):
+    """Advance resting maker entries: record fills, retire finished orders."""
+    if mode() != "live":
+        return
+
+    for pending_key, pending in scalp.pending_all("live").items():
+        order_id = pending.get("order_id")
+        expired = bool(
+            pending.get("expire_epoch")
+            and time.time() > float(pending["expire_epoch"]) + 10
+        )
+
+        try:
+            payload = await client.get_order(order_id)
+        except KalshiAuthError:
+            raise
+        except KalshiApiError as error:
+            status["last_error"] = f"Entry order poll failed: {error}"
+            if expired:
+                # Kalshi already expired the order server-side; if the status
+                # endpoint will not answer, there is nothing left to track.
+                scalp.pending_del("live", pending_key)
+            continue
+
+        state_name, filled, remaining = client.order_progress(payload)
+        _record_pending_fills(pending_key, pending, filled)
+
+        if state_name in ("executed", "canceled") or remaining <= 0 or expired:
+            scalp.pending_del("live", pending_key)
+            if filled <= 0:
+                risk.log_decision(
+                    {
+                        "event": "entry",
+                        "mode": "live",
+                        "outcome": "rest_expired",
+                        "ticker": pending.get("ticker"),
+                        "side": pending.get("side"),
+                        "price_cents": pending.get("price_cents"),
+                        "count": pending.get("count"),
+                        "reason": "Resting entry expired unfilled -- no fee, no trade counted",
+                    }
+                )
+                status["last_decision"] = {
+                    "outcome": "rest_expired",
+                    "reason": (
+                        f"Resting entry on {pending.get('ticker')} expired "
+                        f"unfilled after {config.settings.entry_rest_seconds}s"
+                    ),
+                }
+
+
+async def _cancel_pending_entry(client, pending_key, pending, reason):
+    """Cancel a resting entry order, absorbing any last-instant fills."""
+    order_id = pending.get("order_id")
+
+    try:
+        await client.cancel_order(order_id)
+    except KalshiAuthError:
+        raise
+    except KalshiApiError:
+        pass  # already executed, expired or canceled -- the poll below settles it
+
+    try:
+        payload = await client.get_order(order_id)
+        _, filled, _ = client.order_progress(payload)
+        _record_pending_fills(pending_key, pending, filled)
+    except KalshiAuthError:
+        raise
+    except KalshiApiError:
+        pass
+
+    scalp.pending_del("live", pending_key)
+    risk.log_decision(
+        {
+            "event": "entry",
+            "mode": "live",
+            "outcome": "rest_canceled",
+            "ticker": pending.get("ticker"),
+            "side": pending.get("side"),
+            "reason": reason,
+        }
+    )
+
+
+async def _place_maker_entry(client, signal, market, record, sizing):
+    """Rest a post-only bid instead of crossing the spread.
+
+    No lot is opened here -- fills are observed by _poll_pending_entries as
+    they land. A resting order that expires unfilled cost nothing: no fee, no
+    cooldown, no daily trade count. That asymmetry is the entire trade-off of
+    maker entries: zero fees and a better price, paid for with the risk of
+    simply not getting filled.
+    """
+    cfg = config.settings
+    ticker, side = signal["ticker"], signal["side"]
+    count = sizing["count"]
+    price = signal.get("maker_entry_price_cents")
+
+    if not price or price <= 0:
+        record["outcome"] = "blocked"
+        record["risk_reason"] = "No maker entry price available (no bid on our side)"
+        status["last_decision"] = {"outcome": "blocked", "reason": record["risk_reason"]}
+        risk.log_decision(record)
+        return
+
+    now = time.time()
+    close = policy.close_epoch(market)
+    expire = int(now + cfg.entry_rest_seconds)
+    if close:
+        expire = min(expire, int(close - cfg.settlement_guard_seconds - 5))
+    if expire <= now + 2:
+        record["outcome"] = "blocked"
+        record["risk_reason"] = "Too close to the settlement guard to rest an entry"
+        status["last_decision"] = {"outcome": "blocked", "reason": record["risk_reason"]}
+        risk.log_decision(record)
+        return
+
+    try:
+        response = await client.place_resting(
+            ticker=ticker,
+            action="buy",
+            side=side,
+            count=count,
+            price_cents=int(price),
+            client_order_id=_order_id("entry"),
+            expire_epoch=expire,
+        )
+        record["response"] = response
+    except KalshiAuthError as error:
+        risk.halt(f"Authentication rejected during entry: {error}")
+        record["outcome"] = "auth_error"
+        record["error"] = str(error)
+        status["last_error"] = str(error)
+        status["last_decision"] = {"outcome": "auth_error", "reason": str(error)}
+        risk.log_decision(record)
+        raise
+    except KalshiApiError as error:
+        record["outcome"] = "order_error"
+        record["error"] = str(error)
+        status["last_error"] = str(error)
+        status["last_decision"] = {"outcome": "order_error", "reason": str(error)}
+        risk.log_decision(record)
+        return
+
+    order = (response or {}).get("order") or response or {}
+    order_id = order.get("order_id")
+    state_name, filled, _ = client.order_progress(response)
+
+    if not order_id or (state_name == "canceled" and filled <= 0):
+        # post_only killed the order because it would have crossed a book
+        # that moved between the signal and the placement.
+        record["outcome"] = "rest_rejected"
+        status["last_decision"] = {
+            "outcome": "rest_rejected",
+            "reason": f"Post-only entry at {price}c would have crossed; book moved",
+        }
+        risk.log_decision(record)
+        return
+
+    pending = {
+        "order_id": order_id,
+        "ticker": ticker,
+        "side": side,
+        "count": count,
+        "price_cents": int(price),
+        "close_epoch": close,
+        "placed_at": int(now),
+        "expire_epoch": expire,
+        "filled_recorded": 0,
+        "trade_counted": False,
+    }
+    scalp.pending_put("live", scalp.key(ticker, side), pending)
+
+    if filled > 0:
+        _record_pending_fills(scalp.key(ticker, side), pending, filled)
+
+    record["outcome"] = "resting"
+    record["maker_price_cents"] = int(price)
+    record["expire_epoch"] = expire
+    risk.log_decision(record)
+    status["last_decision"] = {
+        "outcome": "resting",
+        "reason": (
+            f"Resting {count} {side} @ {price}c on {ticker} "
+            f"(maker, expires in {max(1, int(expire - now))}s)"
+        ),
+    }
+
+
+# ---- maker exits -----------------------------------------------------------
+# The profit ladder rests on the book as post-only reduce-only asks instead of
+# being fired as taker IOC sells when the bid touches a target. Two effects:
+# the fee on every profitable exit drops to zero, and the fill happens at our
+# price the moment anyone crosses -- capturing the spread instead of paying
+# it. Stops, trails and time exits still cross immediately as takers: when
+# the trade is wrong, certainty of exit is worth the fee.
+
+
+async def _ensure_exit_ladder(client, lot, bid):
+    """Rest the profit ladder for a live lot that does not have one yet.
+
+    The allocation is computed once and stored on the lot, so partial rung
+    fills do not reshuffle contracts between tiers on later ticks. Rungs sit
+    at entry + target, but never at or below the current bid (a post-only ask
+    at the bid would cross and be rejected); if the bid has already run past
+    a target, the rung rests one cent above the bid and keeps the extra.
+    """
+    plan_ = lot.get("ladder_plan")
+    if plan_ is None:
+        plan_ = [
+            [tier.name, tier.cents, count]
+            for tier, count in scalp.ladder_allocation(lot.get("count_open") or 0)
+        ]
+        lot = (
+            scalp.update_lot("live", lot["key"], {"ladder_plan": plan_, "exit_orders": {}})
+            or lot
+        )
+
+    exit_orders = dict(lot.get("exit_orders") or {})
+
+    expire = None
+    if lot.get("close_epoch"):
+        expire = int(lot["close_epoch"] - config.settings.settlement_guard_seconds)
+        if expire <= time.time() + 3:
+            return lot  # the settlement guard takes it from here
+
+    entry_price = int(round(lot.get("entry_price") or 0))
+    changed = False
+
+    for tier_name, tier_cents, count in plan_:
+        if count <= 0 or tier_name in exit_orders:
+            continue
+
+        price = min(99, entry_price + int(tier_cents))
+        if bid is not None:
+            price = min(99, max(price, int(bid) + 1))
+
+        try:
+            response = await client.place_resting(
+                ticker=lot["ticker"],
+                action="sell",
+                side=lot["side"],
+                count=count,
+                price_cents=price,
+                client_order_id=_order_id("ladder"),
+                expire_epoch=expire,
+                reduce_only=True,
+            )
+        except KalshiAuthError:
+            raise
+        except KalshiApiError as error:
+            status["last_error"] = f"Ladder rung failed on {lot['ticker']}: {error}"
+            continue
+
+        order = (response or {}).get("order") or response or {}
+        order_id = order.get("order_id")
+        if not order_id:
+            continue
+
+        exit_orders[tier_name] = {
+            "order_id": order_id,
+            "price_cents": price,
+            "count": count,
+            "filled_recorded": 0,
+            "done": False,
+        }
+        changed = True
+
+    if changed:
+        lot = scalp.update_lot("live", lot["key"], {"exit_orders": exit_orders}) or lot
+        risk.log_decision(
+            {
+                "event": "ladder",
+                "mode": "live",
+                "ticker": lot["ticker"],
+                "side": lot["side"],
+                "entry_price_cents": lot.get("entry_price"),
+                "rungs": {
+                    name: {"price_cents": rung["price_cents"], "count": rung["count"]}
+                    for name, rung in exit_orders.items()
+                },
+            }
+        )
+
+    return lot
+
+
+async def _poll_exit_orders(client, lot):
+    """Absorb fills on the resting ladder into realized P&L."""
+    exit_orders = dict(lot.get("exit_orders") or {})
+    changed = False
+
+    for tier_name, rung in exit_orders.items():
+        if rung.get("done") or not rung.get("order_id"):
+            continue
+
+        try:
+            payload = await client.get_order(rung["order_id"])
+        except KalshiAuthError:
+            raise
+        except KalshiApiError as error:
+            status["last_error"] = f"Exit order poll failed: {error}"
+            continue
+
+        state_name, filled, _ = client.order_progress(payload)
+        new_fill = filled - int(rung.get("filled_recorded") or 0)
+
+        if new_fill > 0:
+            realized = scalp.record_exit(
+                "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+            )
+            rung["filled_recorded"] = filled
+            changed = True
+
+            risk.log_decision(
+                {
+                    "event": "exit",
+                    "mode": "live",
+                    "ticker": lot["ticker"],
+                    "side": lot["side"],
+                    "tier": tier_name,
+                    "kind": "profit",
+                    "count": new_fill,
+                    "limit_price_cents": rung["price_cents"],
+                    "entry_price_cents": lot.get("entry_price"),
+                    "outcome": "exited",
+                    "realized_cents": realized,
+                    "reason": "Resting ladder fill (maker, zero fee)",
+                }
+            )
+            status["last_exit"] = {
+                "ticker": lot["ticker"],
+                "tier": tier_name,
+                "kind": "profit",
+                "count": new_fill,
+                "price_cents": rung["price_cents"],
+                "realized_cents": realized,
+                "reason": "Resting ladder fill (maker, zero fee)",
+                "at": int(time.time()),
+            }
+
+        if state_name in ("executed", "canceled"):
+            rung["done"] = True
+            changed = True
+
+    if changed:
+        scalp.update_lot("live", lot["key"], {"exit_orders": exit_orders})
+        return scalp.get("live", lot["key"]) or lot
+
+    return lot
+
+
+async def _cancel_exit_orders(client, lot):
+    """Pull every resting rung off the book before an urgent taker exit.
+
+    Each rung gets a final status check after the cancel, because a fill can
+    land in the instant between our decision and the cancel reaching the
+    book. Selling those contracts again would open a short.
+    """
+    exit_orders = dict(lot.get("exit_orders") or {})
+
+    for tier_name, rung in exit_orders.items():
+        if rung.get("done") or not rung.get("order_id"):
+            continue
+
+        try:
+            await client.cancel_order(rung["order_id"])
+        except KalshiAuthError:
+            raise
+        except KalshiApiError:
+            pass  # already executed or expired -- the poll below settles it
+
+        try:
+            payload = await client.get_order(rung["order_id"])
+            _, filled, _ = client.order_progress(payload)
+            new_fill = filled - int(rung.get("filled_recorded") or 0)
+            if new_fill > 0:
+                realized = scalp.record_exit(
+                    "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+                )
+                rung["filled_recorded"] = filled
+                risk.log_decision(
+                    {
+                        "event": "exit",
+                        "mode": "live",
+                        "ticker": lot["ticker"],
+                        "side": lot["side"],
+                        "tier": tier_name,
+                        "kind": "profit",
+                        "count": new_fill,
+                        "limit_price_cents": rung["price_cents"],
+                        "entry_price_cents": lot.get("entry_price"),
+                        "outcome": "exited",
+                        "realized_cents": realized,
+                        "reason": "Ladder fill caught during cancel",
+                    }
+                )
+        except KalshiAuthError:
+            raise
+        except KalshiApiError:
+            pass
+
+        rung["done"] = True
+
+    scalp.update_lot("live", lot["key"], {"exit_orders": exit_orders})
+    return scalp.get("live", lot["key"]) or lot
+
+
 async def reconcile(client):
     """Refresh balance and positions from Kalshi, adopting anything untracked."""
     active = mode()
@@ -207,6 +685,9 @@ async def run_exits(client):
     if active == "off":
         return
 
+    maker_exits = active == "live" and config.settings.exit_style == "maker"
+    pending = scalp.pending_all("live") if active == "live" else {}
+
     for lot in scalp.open_lots(active):
         ticker, side = lot["ticker"], lot["side"]
 
@@ -219,17 +700,47 @@ async def run_exits(client):
             continue
 
         bid = policy.bid_for_side(snap, side)
+
+        if maker_exits:
+            lot = await _poll_exit_orders(client, lot)
+            if (lot.get("count_open") or 0) <= 0:
+                continue
+            # While the entry order is still resting the lot may keep growing;
+            # the ladder is placed once the entry order is settled.
+            if lot["key"] not in pending:
+                lot = await _ensure_exit_ladder(client, lot, bid)
+
         if bid is None:
-            # No bid means no exit is possible this tick. The settlement guard
-            # will still fire once the clock runs down, but there is nothing to
-            # sell into right now.
+            # No bid means no taker exit is possible this tick. The settlement
+            # guard will still fire once the clock runs down, but there is
+            # nothing to sell into right now.
             continue
 
         marked = scalp.mark(active, lot["key"], bid)
         if not marked:
             continue
 
-        for intent in scalp.plan(marked, bid):
+        intents = scalp.plan(marked, bid, include_profit=not maker_exits)
+        if not intents:
+            continue
+
+        if maker_exits:
+            # Urgent exit (stop/trail/time). Pull our own resting orders first
+            # so the taker sell cannot race them, absorb any last-instant
+            # fills, then re-plan against what is actually still open.
+            if marked["key"] in pending:
+                await _cancel_pending_entry(
+                    client,
+                    marked["key"],
+                    pending.pop(marked["key"]),
+                    f"Urgent exit fired on {ticker}",
+                )
+            marked = await _cancel_exit_orders(client, marked)
+            if (marked.get("count_open") or 0) <= 0:
+                continue
+            intents = scalp.plan(marked, bid, include_profit=False)
+
+        for intent in intents:
             await _execute_exit(client, active, marked, intent)
 
 
@@ -293,6 +804,11 @@ async def _execute_exit(client, active, lot, intent):
         active, lot["key"], intent["tier"], intent["kind"], count, price
     )
 
+    if intent["kind"] == "stop":
+        # Start the post-stop cooldown in dryrun too, so the simulation paces
+        # entries the same way live trading would.
+        risk.note_stop()
+
     record["outcome"] = "exited" if active == "live" else "simulated"
     record["realized_cents"] = realized
     risk.log_decision(record)
@@ -318,10 +834,16 @@ async def run_entry(client, signal, market):
         return
 
     open_lots = scalp.open_lots(active)
-    open_tickers = [lot["ticker"] for lot in open_lots]
+    pending = scalp.pending_all("live") if active == "live" else {}
+    open_tickers = [lot["ticker"] for lot in open_lots] + [
+        entry.get("ticker") for entry in pending.values()
+    ]
 
+    # A resting entry order counts as an open position for the risk gate: it
+    # can become one at any moment, and stacking a second attempt on the same
+    # market would double the intended size.
     approved, reason, sizing = risk.check(
-        signal, status.get("balance_cents"), len(open_lots), open_tickers
+        signal, status.get("balance_cents"), len(open_lots) + len(pending), open_tickers
     )
 
     record = {
@@ -343,6 +865,10 @@ async def run_entry(client, signal, market):
     side = signal["side"]
     price = int(signal["price_cents"])
     count = sizing["count"]
+
+    if active == "live" and config.settings.entry_style == "maker":
+        await _place_maker_entry(client, signal, market, record, sizing)
+        return
 
     if active == "live":
         try:
@@ -421,7 +947,9 @@ async def run_entry(client, signal, market):
 async def tick(client, signal_provider, market_provider):
     status["last_tick_at"] = int(time.time())
 
-    # Exits first, always. See the module docstring.
+    # Resting entries first: their fills create the lots the exit pass must
+    # then protect. Then exits, always before entries. See module docstring.
+    await _poll_pending_entries(client)
     await run_exits(client)
 
     # Evaluate the daily loss limit every tick, independent of whether a BUY
