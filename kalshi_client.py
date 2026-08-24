@@ -248,7 +248,9 @@ class KalshiClient:
 
     # ---- orders ----
 
-    async def _place(self, ticker, action, side, count, price_cents, client_order_id, tif):
+    async def _place(
+        self, ticker, action, side, count, price_cents, client_order_id, tif, **extra
+    ):
         """Submit a limit order via the V2 endpoint (/portfolio/events/orders).
 
         Limit, never market: a market order on a thin 15-minute book can fill
@@ -282,6 +284,7 @@ class KalshiClient:
             "time_in_force": tif or "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
         }
+        body.update({key: value for key, value in extra.items() if value is not None})
         return await self.request("POST", self.order_path, body=body)
 
     @staticmethod
@@ -296,6 +299,74 @@ class KalshiClient:
             return int(float((response or {}).get("fill_count") or 0))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _fp_int(value):
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def order_progress(cls, order_payload):
+        """(status, filled, remaining) for a GET /portfolio/orders/{id} payload.
+
+        status is 'resting', 'executed', or 'canceled'. Counts are fixed-point
+        strings ('6.00') parsed to whole contracts. A canceled order can still
+        carry fills that landed before the cancel, so callers must always
+        reconcile fill_count, not just the status.
+        """
+        order = (order_payload or {}).get("order") or order_payload or {}
+        status = order.get("status") or ""
+        filled = cls._fp_int(order.get("fill_count_fp", order.get("fill_count")))
+        remaining = cls._fp_int(order.get("remaining_count_fp", order.get("remaining_count")))
+        return status, filled, remaining
+
+    async def get_order(self, order_id):
+        """Status and fill progress of one order."""
+        return await self.request("GET", f"/portfolio/orders/{order_id}")
+
+    async def cancel_order(self, order_id):
+        """Cancel a resting order via the V2 endpoint.
+
+        Returns the V2 cancel payload ({order_id, reduced_by, ts_ms}).
+        Cancelling an order that already executed or expired raises a 404
+        KalshiApiError, which callers treat as 'nothing left to cancel'.
+        """
+        return await self.request("DELETE", f"{self.order_path}/{order_id}")
+
+    async def place_resting(
+        self,
+        ticker,
+        action,
+        side,
+        count,
+        price_cents,
+        client_order_id,
+        expire_epoch=None,
+        reduce_only=False,
+    ):
+        """Rest a post-only limit order on the book (the maker leg).
+
+        post_only guarantees the order never crosses: if the book moved and
+        the price would match immediately, Kalshi rejects or cancels it rather
+        than filling as a taker, so the zero-fee assumption cannot silently
+        break. good_till_canceled plus expiration_time makes every resting
+        order self-cleaning -- a crashed process leaves nothing on the book
+        past its expiry.
+        """
+        return await self._place(
+            ticker,
+            action,
+            side,
+            count,
+            price_cents,
+            client_order_id,
+            "good_till_canceled",
+            post_only=True,
+            expiration_time=int(expire_epoch) if expire_epoch else None,
+            reduce_only=True if reduce_only else None,
+        )
 
     async def create_order(self, ticker, side, count, price_cents, client_order_id):
         """Buy to open. Fill-or-kill: a partial entry at a stale price is worse
