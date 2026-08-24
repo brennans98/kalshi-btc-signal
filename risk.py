@@ -96,9 +96,9 @@ def log_decision(record):
     try:
         path = config.settings.decision_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        newline = chr(10)
         with path.open("a") as handle:
-            handle.write(json.dumps(record) + "
-")
+            handle.write(json.dumps(record) + newline)
     except Exception:
         pass
 
