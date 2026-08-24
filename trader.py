@@ -5,20 +5,27 @@ Three modes, set by TRADING_MODE:
     dryrun  full decision path including simulated round trips; places nothing
     live    places real orders
 
-Order of operations on every tick is deliberate: EXITS FIRST, then entries.
-An open scalp is capital already at risk on a contract with minutes of life
-left; a new entry is optional. If the loop is slow, or an error interrupts it,
-the work that must not be skipped is the ladder and the stops.
+Order of operations on every tick is deliberate: EXITS, then a loss-limit
+check, then entries. An open scalp is capital already at risk on a contract
+with minutes of life left; a new entry is optional. If the loop is slow, or an
+error interrupts it, the work that must not be skipped is the ladder and the
+stops.
 
 Exits are also exempt from the risk gate. Cooldowns, daily trade caps and even a
 latched halt block new entries only. Refusing to sell an open position is not a
 safety measure -- it is the opposite, and a halt that stranded a position would
 be worse than no halt at all.
 
+The daily loss limit is checked every tick via risk.check_halt(), independent
+of whether a BUY signal exists. Evaluating it only inside the entry path would
+mean a quiet stretch with no new signals -- while exits keep realizing losses
+via stops -- could sit past the limit indefinitely without ever halting.
+
 dryrun is a real simulation, not a no-op: it opens paper lots, marks them
 against the live book every tick, and walks them through the same ladder,
-stops and guards. What it produces is the thing worth reviewing before going
-live -- a record of complete round trips, with the reason for every exit.
+stops and guards, including the same cooldown and daily trade cap accounting
+as live. What it produces is the thing worth reviewing before going live -- a
+record of complete round trips, with the reason for every exit.
 Paper lots are stored in a separate file from live ones.
 
 Positions are reconciled against Kalshi rather than tracked locally, so a
@@ -75,8 +82,9 @@ def snapshot():
     payload["halt_reason"] = state.get("halt_reason")
     payload["halt_is_manual"] = bool(state.get("halt_is_manual"))
     payload["trades_today"] = state.get("trades_today", 0)
+    payload["cost_today_cents"] = state.get("cost_today_cents", 0)
     payload["day_start_balance_cents"] = state.get("day_start_balance_cents")
-    payload["drawdown_cents"] = risk.drawdown_cents(status.get("balance_cents"))
+    payload["drawdown_cents"] = risk.drawdown_cents(status.get("balance_cents"), state=state)
     payload["scalp"] = scalp.view(active if active != "off" else "dryrun")
     return payload
 
@@ -347,7 +355,11 @@ async def run_entry(client, signal, market):
             risk.log_decision(record)
             return
 
-        risk.record_trade(ticker, count, sizing["cost_cents"])
+    # Recorded in both live and dryrun. Cooldown and the daily trade cap are
+    # pacing limits, not capital controls -- they need to be exercised in
+    # dryrun too, or a dry run can fire trades back-to-back at a rate live
+    # trading never could, making the simulation misleading.
+    risk.record_trade(ticker, count, sizing["cost_cents"])
 
     scalp.record_entry(active, ticker, side, count, price, policy.close_epoch(market))
 
@@ -380,6 +392,10 @@ async def tick(client, signal_provider, market_provider):
 
     # Exits first, always. See the module docstring.
     await run_exits(client)
+
+    # Evaluate the daily loss limit every tick, independent of whether a BUY
+    # signal exists this cycle. See module docstring.
+    risk.check_halt(status.get("balance_cents"))
 
     if risk.is_halted():
         state = risk.load_state()
