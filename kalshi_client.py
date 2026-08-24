@@ -233,7 +233,7 @@ class KalshiClient:
 
     async def get_api_limits(self):
         """Current usage tier and token-bucket limits."""
-        return await self.request("GET", "/account/api_limits")
+        return await self.request("GET", "/account/limits")
 
     async def upgrade_api_tier(self):
         """Request the Advanced usage tier.
