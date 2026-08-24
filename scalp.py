@@ -35,12 +35,16 @@ import time
 import config
 
 
+def _blank_tier_hits():
+    return {tier.name: 0 for tier in config.settings.tiers()}
+
+
 def _blank():
     return {
         "lots": {},
         "stats": {
             "round_trips": 0,
-            "tier_hits": {"small": 0, "medium": 0, "large": 0},
+            "tier_hits": _blank_tier_hits(),
             "stop_exits": 0,
             "trail_exits": 0,
             "time_exits": 0,
@@ -106,7 +110,14 @@ def get(mode, lot_key):
 
 
 def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
-    """Open (or add to) a lot. Averages the basis if a lot already exists."""
+    """Open (or add to) a lot. Averages the basis if a lot already exists.
+
+    Averaging into an existing lot moves the basis, which invalidates the
+    ladder's prior progress: a tier marked "done" against the old basis may
+    not actually have been reached against the new, higher basis. tiers_done
+    and peak_gain are reset here so the ladder re-evaluates from the new
+    basis rather than skipping rungs it has not actually earned.
+    """
     state = load(mode)
     lot_key = key(ticker, side)
     now = time.time()
@@ -119,6 +130,8 @@ def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
         existing["count_open"] = held + count
         existing["count_original"] = existing.get("count_original", held) + count
         existing["close_epoch"] = close_epoch or existing.get("close_epoch")
+        existing["tiers_done"] = []
+        existing["peak_gain"] = 0
         state["lots"][lot_key] = existing
     else:
         state["lots"][lot_key] = {
