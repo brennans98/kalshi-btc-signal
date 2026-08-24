@@ -95,13 +95,33 @@ class Settings:
     stale_feed_seconds: float = field(default_factory=lambda: _float("STALE_FEED_SECONDS", 5.0))
 
     # ---- fees ------------------------------------------------------------
-    # Kalshi charges ceil(0.07 * C * P * (1-P) * 100) cents per fill. This adds
-    # a cushion above the raw fee estimate before an edge is considered
-    # tradable, so a fee-rounding quirk or a slightly-stale price doesn't turn
-    # a marginal "profitable" trade into a guaranteed loss.
+    # Kalshi charges ceil(0.07 * C * P * (1-P) * 100) cents per TAKER fill.
+    # Maker (resting) fills on this series (fee_type "quadratic", per the
+    # published fee schedule) are charged the taker formula scaled by
+    # MAKER_FEE_MULT, which is 0 for KXBTC15M -- resting orders trade free.
+    # The safety margin adds a cushion above the raw fee estimate before an
+    # edge is considered tradable, so a fee-rounding quirk or a slightly-stale
+    # price doesn't turn a marginal "profitable" trade into a guaranteed loss.
     fee_safety_margin_cents: float = field(
         default_factory=lambda: _float("FEE_SAFETY_MARGIN_CENTS", 0.5)
     )
+    maker_fee_multiplier: float = field(default_factory=lambda: _float("MAKER_FEE_MULT", 0.0))
+
+    # ---- execution style -------------------------------------------------
+    # maker: entries rest as post-only bids and ladder exits rest as post-only
+    #        asks, paying zero fees on this series and earning the spread
+    #        instead of paying it. Stops and guards always cross as takers --
+    #        an exit that must happen now cannot wait in a queue.
+    # taker: the previous behaviour (FOK entries, IOC exits) as a fallback.
+    entry_style: str = field(default_factory=lambda: _str("ENTRY_STYLE", "maker").lower())
+    exit_style: str = field(default_factory=lambda: _str("EXIT_STYLE", "maker").lower())
+    # How far above the current bid a maker entry may improve to gain queue
+    # priority. Clamped so it never locks or crosses the book.
+    maker_improve_cents: int = field(default_factory=lambda: _int("MAKER_IMPROVE_CENTS", 1))
+    # How long a maker entry rests before Kalshi auto-cancels it. Short on
+    # purpose: a 15-minute market moves, and an entry that has not filled in
+    # this window was priced for a book that no longer exists.
+    entry_rest_seconds: int = field(default_factory=lambda: _int("ENTRY_REST_SECONDS", 20))
 
     # ---- the profit ladder ---------------------------------------------
     # Three targets, hit in order, each selling part of the position. The
@@ -134,9 +154,21 @@ class Settings:
         default_factory=lambda: _int("MAX_COST_PER_TRADE_CENTS", 500)
     )
     daily_loss_limit_cents: int = field(default_factory=lambda: _int("DAILY_LOSS_LIMIT_CENTS", 2000))
+    # The absolute daily loss limit above is meaningless when it exceeds the
+    # account balance. The effective limit is the SMALLER of the absolute cap
+    # and this percentage of the day's opening balance, so a small account is
+    # bounded by a number it can actually feel.
+    daily_loss_limit_pct: int = field(default_factory=lambda: _int("DAILY_LOSS_LIMIT_PCT", 25))
+    # Cap the worst-case loss of a single trade (contracts x stop distance) to
+    # a fraction of the balance, so one stop-out cannot take a large bite.
+    per_trade_risk_pct: int = field(default_factory=lambda: _int("PER_TRADE_RISK_PCT", 15))
     max_trades_per_day: int = field(default_factory=lambda: _int("MAX_TRADES_PER_DAY", 40))
     max_open_positions: int = field(default_factory=lambda: _int("MAX_OPEN_POSITIONS", 2))
     cooldown_seconds: int = field(default_factory=lambda: _int("COOLDOWN_SECONDS", 20))
+    # After a stop-out, no new entries for this long. The 15:48-15:50 pattern
+    # this exists for: stop, re-enter the same direction 30 seconds later,
+    # stop again, re-enter again -- three stops inside two minutes of chop.
+    stop_cooldown_seconds: int = field(default_factory=lambda: _int("STOP_COOLDOWN_SECONDS", 120))
 
     # ---- loop ----------------------------------------------------------
     loop_seconds: float = field(default_factory=lambda: _float("TRADE_LOOP_SECONDS", 2.0))
@@ -218,6 +250,18 @@ class Settings:
                 "SCALP_STOP_CENTS is inside MAX_SPREAD_CENTS: the stop can trigger on "
                 "spread alone, before price moves"
             )
+        if self.entry_style not in ("maker", "taker"):
+            issues.append("ENTRY_STYLE must be 'maker' or 'taker'")
+        if self.exit_style not in ("maker", "taker"):
+            issues.append("EXIT_STYLE must be 'maker' or 'taker'")
+        if not 0 <= self.maker_fee_multiplier <= 1:
+            issues.append("MAKER_FEE_MULT must be between 0 and 1")
+        if not 1 <= self.daily_loss_limit_pct <= 100:
+            issues.append("DAILY_LOSS_LIMIT_PCT must be between 1 and 100")
+        if not 1 <= self.per_trade_risk_pct <= 100:
+            issues.append("PER_TRADE_RISK_PCT must be between 1 and 100")
+        if self.entry_rest_seconds < 2:
+            issues.append("ENTRY_REST_SECONDS must be at least 2")
 
         return issues
 
@@ -240,9 +284,17 @@ class Settings:
             "max_contracts_per_trade": self.max_contracts_per_trade,
             "max_cost_per_trade_cents": self.max_cost_per_trade_cents,
             "daily_loss_limit_cents": self.daily_loss_limit_cents,
+            "daily_loss_limit_pct": self.daily_loss_limit_pct,
+            "per_trade_risk_pct": self.per_trade_risk_pct,
             "max_trades_per_day": self.max_trades_per_day,
             "max_open_positions": self.max_open_positions,
             "cooldown_seconds": self.cooldown_seconds,
+            "stop_cooldown_seconds": self.stop_cooldown_seconds,
+            "entry_style": self.entry_style,
+            "exit_style": self.exit_style,
+            "maker_improve_cents": self.maker_improve_cents,
+            "entry_rest_seconds": self.entry_rest_seconds,
+            "maker_fee_multiplier": self.maker_fee_multiplier,
             "credentials_present": bool(self.key_id and self.private_key_pem),
             "config_problems": self.problems(),
         }
