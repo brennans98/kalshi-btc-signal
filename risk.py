@@ -38,7 +38,11 @@ def limits():
         "max_open_positions": cfg.max_open_positions,
         "max_trades_per_day": cfg.max_trades_per_day,
         "daily_loss_limit_cents": cfg.daily_loss_limit_cents,
+        "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
+        "effective_daily_loss_limit_cents": effective_loss_limit_cents(),
+        "per_trade_risk_pct": cfg.per_trade_risk_pct,
         "cooldown_seconds": cfg.cooldown_seconds,
+        "stop_cooldown_seconds": cfg.stop_cooldown_seconds,
     }
 
 
@@ -53,6 +57,7 @@ def _blank_state():
         "trades_today": 0,
         "cost_today_cents": 0,
         "last_trade_at": 0,
+        "last_stop_at": 0,
         "halted": False,
         "halt_reason": None,
         "halt_is_manual": False,
@@ -171,6 +176,42 @@ def drawdown_cents(balance_cents, state=None):
     return max(0, opening - int(balance_cents))
 
 
+def effective_loss_limit_cents(state=None):
+    """The daily loss limit that actually applies today.
+
+    The absolute cap (DAILY_LOSS_LIMIT_CENTS) is only meaningful while the
+    account is larger than it. A 2000c limit on a 500c account is no limit at
+    all -- the account would be empty long before the halt fired. The
+    effective limit is the smaller of the absolute cap and
+    DAILY_LOSS_LIMIT_PCT of the day's opening balance.
+    """
+    cfg = config.settings
+    state = state or load_state()
+    limit = cfg.daily_loss_limit_cents
+
+    opening = state.get("day_start_balance_cents")
+    if opening:
+        pct_cap = max(1, int(opening) * cfg.daily_loss_limit_pct // 100)
+        limit = min(limit, pct_cap)
+
+    return limit
+
+
+def note_stop():
+    """Record that a stop-out just happened, starting the post-stop cooldown.
+
+    A stop means the model was wrong about this market a moment ago. The
+    minutes after a stop are exactly when the same wrong read is most likely
+    to fire again -- the 15:48-15:50 sequence in the trade log was three
+    stop-outs in two minutes of chop, each re-entering seconds after the
+    last. Entries wait out STOP_COOLDOWN_SECONDS instead.
+    """
+    state = load_state()
+    state["last_stop_at"] = int(time.time())
+    save_state(state)
+    return state
+
+
 def check_halt(balance_cents):
     """Evaluate the daily loss limit and latch a halt if it has been breached.
 
@@ -188,10 +229,12 @@ def check_halt(balance_cents):
         return state
 
     drawdown = drawdown_cents(balance_cents, state=state)
-    if drawdown is not None and drawdown >= cfg.daily_loss_limit_cents:
+    limit = effective_loss_limit_cents(state=state)
+    if drawdown is not None and drawdown >= limit:
         return halt(
-            f"Daily loss limit reached (down {drawdown}c of "
-            f"{cfg.daily_loss_limit_cents}c allowed)"
+            f"Daily loss limit reached (down {drawdown}c of {limit}c allowed "
+            f"-- the lesser of {cfg.daily_loss_limit_cents}c absolute and "
+            f"{cfg.daily_loss_limit_pct}% of the day's opening balance)"
         )
 
     return state
@@ -242,6 +285,13 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     if elapsed < cfg.cooldown_seconds:
         return False, f"Cooldown active ({int(cfg.cooldown_seconds - elapsed)}s remaining)", None
 
+    since_stop = time.time() - float(state.get("last_stop_at") or 0)
+    if since_stop < cfg.stop_cooldown_seconds:
+        return False, (
+            f"Post-stop cooldown ({int(cfg.stop_cooldown_seconds - since_stop)}s "
+            f"remaining before entries resume)"
+        ), None
+
     price = int(signal.get("price_cents") or 0)
     if price <= 0:
         return False, "Signal carries no executable price", None
@@ -253,6 +303,12 @@ def check(signal, balance_cents, open_position_count, open_tickers):
 
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
+
+    # Bound the worst case of THIS trade, not just its cost: contracts times
+    # the stop distance is what a stop-out actually takes from the account.
+    if balance_cents is not None and cfg.stop_cents > 0:
+        risk_budget = int(balance_cents) * cfg.per_trade_risk_pct // 100
+        count = min(count, max(0, risk_budget // cfg.stop_cents))
 
     # Never size beyond what the exit side can absorb. Entering 6 contracts
     # against a 2-lot bid means the ladder cannot sell what it just bought.
