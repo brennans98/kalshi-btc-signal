@@ -102,6 +102,8 @@ def log_decision(record):
         with path.open("a") as handle:
             handle.write(json.dumps(record) + "
 ")
+
+")
     except Exception:
         pass
 
