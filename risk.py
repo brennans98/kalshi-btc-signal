@@ -143,13 +143,25 @@ def halt(reason, manual=False):
     return state
 
 
-def resume():
+def resume(rebaseline_balance=None):
+    """Clear a halt and, when a balance is supplied, restart the day from it.
+
+    A manual resume means a person has looked at the account and decided
+    trading should continue. Re-baselining the day's opening balance to what
+    the account holds NOW keeps the loss limit meaningful after a deposit:
+    without it, a top-up leaves the limit measured from a stale, smaller
+    opening balance -- either far too loose (drawdown measured from a number
+    the account has left far behind) or far too tight (a percentage of
+    yesterday's small balance).
+    """
     state = load_state()
     state["halted"] = False
     state["halt_reason"] = None
     state["halt_is_manual"] = False
+    if rebaseline_balance is not None:
+        state["day_start_balance_cents"] = int(rebaseline_balance)
     save_state(state)
-    log_decision({"event": "resume"})
+    log_decision({"event": "resume", "rebaselined_to": rebaseline_balance})
     return state
 
 
