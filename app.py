@@ -282,15 +282,37 @@ def _reset_local_book(ticker):
     _local_book["no"] = {}
 
 
+def _price_cents(value):
+    """Normalize a book price to integer cents.
+
+    Kalshi's WS channel now sends fixed-point dollar strings ('0.9600');
+    older payloads sent integer cents. Strings are dollars, numbers are cents.
+    """
+    try:
+        if isinstance(value, str):
+            return int(round(float(value) * 100))
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _count(value):
+    """Contract counts are fixed-point strings ('54.00', '13832.11') on the
+    current WS channel and integers on older payloads."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _apply_book_levels(side, levels):
-    """levels: list of [price_cents, size] pairs representing the full side."""
+    """levels: list of [price, count] pairs representing the full side."""
     book_side = {}
     for level in levels or []:
         if not isinstance(level, (list, tuple)) or len(level) < 2:
             continue
-        try:
-            price, size = int(level[0]), int(level[1])
-        except (TypeError, ValueError):
+        price, size = _price_cents(level[0]), _count(level[1])
+        if price is None or size is None:
             continue
         if size > 0:
             book_side[price] = size
@@ -298,10 +320,9 @@ def _apply_book_levels(side, levels):
 
 
 def _apply_book_delta(side, price, delta):
-    try:
-        price = int(price)
-        delta = int(delta)
-    except (TypeError, ValueError):
+    price = _price_cents(price)
+    delta = _count(delta)
+    if price is None or delta is None:
         return
     current = _local_book[side].get(price, 0) + delta
     if current > 0:
@@ -313,8 +334,8 @@ def _apply_book_delta(side, price, delta):
 def _publish_local_book():
     state["orderbook"] = {
         "orderbook": {
-            "yes": [[price, size] for price, size in _local_book["yes"].items()],
-            "no": [[price, size] for price, size in _local_book["no"].items()],
+            "yes": [[price, int(size)] for price, size in _local_book["yes"].items()],
+            "no": [[price, int(size)] for price, size in _local_book["no"].items()],
         }
     }
     state["book_error"] = None
@@ -331,14 +352,16 @@ def _handle_ws_message(raw_message, ticker):
         return  # a stale message for a market we've since rolled off of
 
     if msg_type == "orderbook_snapshot":
-        _apply_book_levels("yes", body.get("yes"))
-        _apply_book_levels("no", body.get("no"))
+        # Current channel: yes_dollars_fp/no_dollars_fp with [price_dollars,
+        # count_fp] string pairs. Legacy fallback: yes/no with integer cents.
+        _apply_book_levels("yes", body.get("yes_dollars_fp") or body.get("yes"))
+        _apply_book_levels("no", body.get("no_dollars_fp") or body.get("no"))
         _publish_local_book()
 
     elif msg_type == "orderbook_delta":
         side = body.get("side")
-        price = body.get("price")
-        delta = body.get("delta")
+        price = body.get("price_dollars", body.get("price"))
+        delta = body.get("delta_fp", body.get("delta"))
         if side in ("yes", "no") and price is not None and delta is not None:
             _apply_book_delta(side, price, delta)
             _publish_local_book()
