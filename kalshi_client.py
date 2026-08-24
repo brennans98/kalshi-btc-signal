@@ -68,8 +68,6 @@ class KalshiClient:
         self.ws_url = PROD_WS_URL if cfg.kalshi_env == "prod" else DEMO_WS_URL
         self._key_error = None
         self._http = None
-        # Set if the venue rejects time_in_force, so we stop sending it.
-        self._tif_unsupported = False
 
         try:
             self.private_key = _load_private_key(cfg.private_key_pem)
@@ -251,41 +249,53 @@ class KalshiClient:
     # ---- orders ----
 
     async def _place(self, ticker, action, side, count, price_cents, client_order_id, tif):
-        """Submit a limit order.
+        """Submit a limit order via the V2 endpoint (/portfolio/events/orders).
 
         Limit, never market: a market order on a thin 15-minute book can fill
         far from the price the edge was calculated against, which silently
         invalidates the decision that produced it. On a scalp where the whole
         target is a few cents, that is the difference between the trade working
         and not.
+
+        V2 quotes everything on the YES leg of a single book:
+          buy yes  -> bid at yes price
+          buy no   -> ask at 100 - no price   (buying NO == selling YES)
+          sell yes -> ask at yes price
+          sell no  -> bid at 100 - no price   (selling NO == buying YES back)
+        Prices are fixed-point dollar strings, counts fixed-point contract
+        strings. time_in_force and self_trade_prevention_type are required.
         """
+        price_cents = int(price_cents)
+        if side == "yes":
+            book_side = "bid" if action == "buy" else "ask"
+            yes_cents = price_cents
+        else:
+            book_side = "ask" if action == "buy" else "bid"
+            yes_cents = 100 - price_cents
+
         body = {
             "ticker": ticker,
-            "action": action,
-            "side": side,
-            "count": int(count),
-            "type": "limit",
             "client_order_id": client_order_id,
+            "side": book_side,
+            "count": f"{int(count)}.00",
+            "price": f"{yes_cents // 100}.{yes_cents % 100:02d}00",
+            "time_in_force": tif or "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         }
+        return await self.request("POST", self.order_path, body=body)
 
-        if side == "yes":
-            body["yes_price"] = int(price_cents)
-        else:
-            body["no_price"] = int(price_cents)
+    @staticmethod
+    def filled_count(response):
+        """Contracts filled by a V2 order response, as a whole number.
 
-        if tif and not self._tif_unsupported:
-            body["time_in_force"] = tif
-
+        V2 returns 201 even for a fill-or-kill order that was killed unfilled,
+        so callers must check this rather than treating success as a fill.
+        fill_count is a fixed-point string like '6.00'.
+        """
         try:
-            return await self.request("POST", self.order_path, body=body)
-        except KalshiApiError as error:
-            # Some environments reject time_in_force outright. Retry once
-            # without it rather than failing every order from here on.
-            if tif and not self._tif_unsupported and "time_in_force" in str(error):
-                self._tif_unsupported = True
-                body.pop("time_in_force", None)
-                return await self.request("POST", self.order_path, body=body)
-            raise
+            return int(float((response or {}).get("fill_count") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     async def create_order(self, ticker, side, count, price_cents, client_order_id):
         """Buy to open. Fill-or-kill: a partial entry at a stale price is worse
