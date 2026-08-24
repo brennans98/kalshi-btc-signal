@@ -602,6 +602,20 @@ async def api_flatten(x_admin_token: str = Header(default="")):
 
     closed = []
 
+    # Resting orders first: cancel pending maker entries so nothing new can
+    # fill mid-flatten, and absorb any last-instant fills into lots so the
+    # sweep below sells them too.
+    if lot_mode == "live":
+        for pending_key, pending in scalp.pending_all("live").items():
+            try:
+                await trader._cancel_pending_entry(
+                    client, pending_key, pending, "Manual flatten via API"
+                )
+            except (KalshiApiError, KalshiAuthError) as error:
+                closed.append(
+                    {"ticker": pending.get("ticker"), "error": str(error)[:140]}
+                )
+
     for lot in scalp.open_lots(lot_mode):
         try:
             book = await client.get_orderbook(lot["ticker"])
@@ -619,6 +633,27 @@ async def api_flatten(x_admin_token: str = Header(default="")):
         marked = scalp.mark(lot_mode, lot["key"], bid)
         if not marked:
             continue
+
+        # Pull the lot's resting ladder rungs off the book before the taker
+        # sell, so the flatten cannot race our own asks (and any rung fills
+        # that land during the cancel are recorded, not sold twice).
+        if lot_mode == "live":
+            try:
+                marked = await trader._cancel_exit_orders(client, marked)
+            except (KalshiApiError, KalshiAuthError) as error:
+                closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
+                continue
+            if (marked.get("count_open") or 0) <= 0:
+                closed.append(
+                    {
+                        "ticker": lot["ticker"],
+                        "side": lot["side"],
+                        "sold": 0,
+                        "note": "fully closed by resting ladder fills",
+                        "still_open": 0,
+                    }
+                )
+                continue
 
         wanted = marked["count_open"]
         intent = {
