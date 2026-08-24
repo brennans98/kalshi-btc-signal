@@ -12,8 +12,8 @@ from collections import deque
 from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
@@ -46,6 +46,22 @@ state = {
 
 app = FastAPI(title="BTC 15m Scalper")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def no_cache_headers(request: Request, call_next):
+    """Every response is either live data or a tiny document.
+
+    Browsers (and PWA installs) aggressively cache HTML, JSON and manifests;
+    a stale dashboard silently showing yesterday's signal is worse than the
+    few bytes saved. This is the FastAPI equivalent of Flask's
+    SEND_FILE_MAX_AGE_DEFAULT = 0, applied to /static as well.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 client = KalshiClient()
 
@@ -85,6 +101,56 @@ def current_market():
     return state["market"]
 
 
+def public_trade_log(limit=30):
+    """Recent executed entries and exits, shaped for the dashboard table.
+
+    Only completed actions (opened/simulated entries, exited/simulated exits)
+    are included, with a fixed field projection -- raw decision records carry
+    full order responses and signal internals that stay behind the admin
+    endpoint.
+    """
+    events = []
+
+    for record in risk.read_decisions(200):
+        event = record.get("event")
+
+        if event == "entry" and record.get("outcome") in ("opened", "simulated"):
+            signal = record.get("signal") or {}
+            sizing = record.get("sizing") or {}
+            events.append(
+                {
+                    "at": record.get("logged_at"),
+                    "type": "entry",
+                    "mode": record.get("mode"),
+                    "ticker": signal.get("ticker"),
+                    "side": signal.get("side"),
+                    "count": sizing.get("count"),
+                    "price_cents": signal.get("price_cents"),
+                    "realized_cents": None,
+                    "detail": signal.get("reason"),
+                }
+            )
+        elif event == "exit" and record.get("outcome") in ("exited", "simulated"):
+            events.append(
+                {
+                    "at": record.get("logged_at"),
+                    "type": "exit",
+                    "mode": record.get("mode"),
+                    "ticker": record.get("ticker"),
+                    "side": record.get("side"),
+                    "count": record.get("count"),
+                    "price_cents": record.get("limit_price_cents"),
+                    "realized_cents": record.get("realized_cents"),
+                    "detail": record.get("reason"),
+                }
+            )
+
+        if len(events) >= limit:
+            break
+
+    return events
+
+
 def api_payload():
     market = state["market"] or {}
 
@@ -109,6 +175,7 @@ def api_payload():
             "book_source": state["book_source"],
         },
         "trader": trader.snapshot(),
+        "trade_log": public_trade_log(),
         "config": config.settings.public_view(),
         "updated_at": int(time.time()),
     }
@@ -396,6 +463,31 @@ async def home():
 @app.get("/api/state")
 async def api_state():
     return api_payload()
+
+
+@app.get("/api/stream")
+async def api_stream():
+    """Server-sent events: the /api/state payload pushed once per second.
+
+    The dashboard prefers this over polling; if the connection drops (proxy
+    timeout, mobile sleep) the frontend falls back to fetch polling until the
+    stream resumes.
+    """
+
+    async def event_stream():
+        while True:
+            yield f"data: {json.dumps(api_payload())}\n\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/health")
