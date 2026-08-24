@@ -48,9 +48,7 @@ def _load_private_key(raw):
         return None
 
     # Railway variables commonly arrive with literal backslash-n sequences.
-    pem = raw.replace("\
-", "
-").strip()
+    pem = raw.replace(chr(92) + "n", chr(10)).strip()
 
     try:
         return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
