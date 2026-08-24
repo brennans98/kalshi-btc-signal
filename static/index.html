@@ -1,14 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a1020">
-  <link rel="manifest" href="/manifest.webmanifest">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="manifest" href="/manifest.webmanifest?v=20260824">
   <title>BTC Signal</title>
 
   <style>
-    :root {
+    :root,
+    [data-theme="dark"] {
       --background: #0a1020;
       --panel: #151f38;
       --border: #2b395a;
@@ -17,6 +21,19 @@
       --green: #37df8b;
       --red: #ff6173;
       --yellow: #ffc857;
+      --row-alt: rgba(255, 255, 255, 0.03);
+    }
+
+    [data-theme="light"] {
+      --background: #f3f5fa;
+      --panel: #ffffff;
+      --border: #d4dbea;
+      --text: #131a2c;
+      --muted: #5a6781;
+      --green: #0f9d58;
+      --red: #d93043;
+      --yellow: #b07d10;
+      --row-alt: rgba(0, 0, 0, 0.03);
     }
 
     * { box-sizing: border-box; }
@@ -29,7 +46,7 @@
     }
 
     main {
-      max-width: 680px;
+      max-width: 720px;
       margin: 0 auto;
       padding: 16px;
     }
@@ -38,6 +55,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 10px;
       margin: 6px 0 16px;
     }
 
@@ -49,6 +67,16 @@
     #status {
       color: var(--muted);
       font-size: 12px;
+    }
+
+    #theme-toggle {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 7px 12px;
     }
 
     .signal-card {
@@ -68,6 +96,8 @@
     .up { color: var(--green); }
     .down { color: var(--red); }
     .neutral { color: var(--yellow); }
+    .gain { color: var(--green); }
+    .loss { color: var(--red); }
 
     #confidence {
       font-size: 21px;
@@ -79,7 +109,7 @@
       color: var(--muted);
       line-height: 1.4;
       margin: 12px auto 0;
-      max-width: 530px;
+      max-width: 560px;
     }
 
     .grid {
@@ -109,11 +139,57 @@
       margin-top: 5px;
     }
 
+    .sub {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
+    }
+
+    h2 {
+      font-size: 14px;
+      margin: 0 0 10px;
+    }
+
+    table {
+      border-collapse: collapse;
+      font-size: 13px;
+      width: 100%;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 7px 8px;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    tbody tr:nth-child(even) { background: var(--row-alt); }
+    tbody tr:last-child td { border-bottom: none; }
+
+    .table-scroll { overflow-x: auto; }
+
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 6px 2px;
+    }
+
     footer {
       color: var(--muted);
       font-size: 12px;
       line-height: 1.45;
       margin: 18px 2px;
+    }
+
+    @media (max-width: 460px) {
+      .grid { grid-template-columns: minmax(0, 1fr); }
     }
   </style>
 </head>
@@ -123,6 +199,7 @@
     <header>
       <h1>BTC 15m Signal</h1>
       <span id="status">Connecting…</span>
+      <button id="theme-toggle" type="button" aria-label="Toggle light and dark theme">Light</button>
     </header>
 
     <section class="signal-card">
@@ -135,16 +212,56 @@
       <div class="card wide">
         <div class="label">BTC-USD Live Price</div>
         <div class="value" id="price">—</div>
+        <div class="sub" id="market-title">—</div>
       </div>
 
-      <div class="card">
-        <div class="label">15-second move</div>
-        <div class="value" id="move15">—</div>
+      <div class="card wide">
+        <div class="label">Session P&amp;L <span id="pnl-mode"></span></div>
+        <div class="value" id="pnl">—</div>
+        <div class="sub" id="pnl-detail">—</div>
       </div>
 
-      <div class="card">
-        <div class="label">60-second move</div>
-        <div class="value" id="move60">—</div>
+      <div class="card wide">
+        <h2>Profit Ladder</h2>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Rung</th><th>Target</th><th>Sells</th><th>Hits</th></tr>
+            </thead>
+            <tbody id="ladder-body">
+              <tr><td colspan="4" class="empty">Waiting for data…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="sub" id="ladder-guards">—</div>
+      </div>
+
+      <div class="card wide">
+        <h2>Market Moves</h2>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Window</th><th>Move</th><th>Direction</th></tr>
+            </thead>
+            <tbody id="moves-body">
+              <tr><td colspan="3" class="empty">Waiting for data…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card wide">
+        <h2>Trade Log</h2>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Type</th><th>Ticker</th><th>Side</th><th>Qty</th><th>Price</th><th>P&amp;L</th></tr>
+            </thead>
+            <tbody id="log-body">
+              <tr><td colspan="7" class="empty">No trades recorded yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -155,9 +272,29 @@
   </main>
 
   <script>
+    // ------------------------------------------------------------ theme
+    var themeToggle = document.getElementById("theme-toggle");
+
+    function applyTheme(theme) {
+      document.documentElement.setAttribute("data-theme", theme);
+      themeToggle.textContent = theme === "dark" ? "Light" : "Dark";
+      try { localStorage.setItem("btc-dashboard-theme", theme); } catch (e) {}
+    }
+
+    themeToggle.addEventListener("click", function () {
+      var current = document.documentElement.getAttribute("data-theme");
+      applyTheme(current === "dark" ? "light" : "dark");
+    });
+
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem("btc-dashboard-theme"); } catch (e) {}
+      applyTheme(saved === "light" ? "light" : "dark");
+    })();
+
+    // ------------------------------------------------------------ formatting
     function formatPrice(value) {
       if (value === null || value === undefined) return "—";
-
       return "$" + Number(value).toLocaleString(undefined, {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
@@ -166,50 +303,245 @@
 
     function formatPercent(value) {
       if (value === null || value === undefined) return "—";
-
       return (value >= 0 ? "+" : "") + Number(value).toFixed(3) + "%";
     }
 
-    async function updateDashboard() {
+    function formatCents(value) {
+      if (value === null || value === undefined) return "—";
+      var dollars = value / 100;
+      return (dollars >= 0 ? "+" : "-") + "$" + Math.abs(dollars).toFixed(2);
+    }
+
+    function formatTime(iso) {
+      if (!iso) return "—";
+      var parsed = new Date(iso);
+      if (isNaN(parsed.getTime())) return "—";
+      return parsed.toLocaleTimeString(undefined, {
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+    }
+
+    function text(id, value) {
+      document.getElementById(id).textContent = value;
+    }
+
+    function cell(row, value, className) {
+      var td = document.createElement("td");
+      td.textContent = value;
+      if (className) td.className = className;
+      row.appendChild(td);
+    }
+
+    // ------------------------------------------------------------ rendering
+    function renderSignal(signal) {
+      var actionElement = document.getElementById("action");
+      var action = (signal && signal.action) || "NO TRADE";
+
+      actionElement.textContent = action;
+      actionElement.className = "";
+
+      if (action.indexOf("YES") >= 0 || action.indexOf("UP") >= 0) {
+        actionElement.classList.add("up");
+      } else if (action.indexOf("NO ") === 0 && action !== "NO TRADE" || action.indexOf("DOWN") >= 0) {
+        actionElement.classList.add("down");
+      } else {
+        actionElement.classList.add(action === "NO TRADE" ? "neutral" : "up");
+      }
+
+      text("confidence", ((signal && signal.confidence) || 0) + "% confidence");
+      text("reason", (signal && signal.reason) || "—");
+    }
+
+    function renderPnl(trader) {
+      trader = trader || {};
+      var scalp = trader.scalp || {};
+      var stats = scalp.stats || {};
+      var realized = stats.realized_cents;
+
+      var pnlElement = document.getElementById("pnl");
+      pnlElement.textContent = formatCents(realized === undefined ? null : realized);
+      pnlElement.className = "value " + (realized > 0 ? "gain" : realized < 0 ? "loss" : "");
+
+      text("pnl-mode", trader.mode ? "(" + trader.mode + ")" : "");
+
+      var wins = stats.wins || 0;
+      var losses = stats.losses || 0;
+      var trips = stats.round_trips || 0;
+      var drawdown = trader.drawdown_cents;
+      var detail = trips + " round trips - " + wins + "W / " + losses + "L - " +
+        (trader.trades_today || 0) + " trades today";
+      if (drawdown !== null && drawdown !== undefined) {
+        detail += " - day drawdown " + formatCents(-Math.abs(drawdown));
+      }
+      if (trader.halted) {
+        detail += " - HALTED: " + (trader.halt_reason || "manual");
+      }
+      text("pnl-detail", detail);
+    }
+
+    function renderLadder(trader) {
+      var scalp = (trader || {}).scalp || {};
+      var ladder = scalp.ladder || [];
+      var hits = (scalp.stats || {}).tier_hits || {};
+      var body = document.getElementById("ladder-body");
+      body.innerHTML = "";
+
+      if (!ladder.length) {
+        var row = document.createElement("tr");
+        cell(row, "Waiting for data…", "empty");
+        body.appendChild(row);
+        return;
+      }
+
+      ladder.forEach(function (tier) {
+        var row = document.createElement("tr");
+        cell(row, tier.name);
+        cell(row, "+" + tier.target_cents + "c", "gain");
+        cell(row, tier.exit_pct + "% of position");
+        cell(row, String(hits[tier.name] || 0));
+        body.appendChild(row);
+      });
+
+      var guards = "Stop " + (scalp.stop_cents !== undefined ? scalp.stop_cents + "c" : "—") +
+        " - Trail " + (scalp.trail_cents !== undefined ? scalp.trail_cents + "c" : "—") +
+        " - Stops " + ((scalp.stats || {}).stop_exits || 0) +
+        " - Trails " + ((scalp.stats || {}).trail_exits || 0) +
+        " - Time exits " + ((scalp.stats || {}).time_exits || 0);
+      text("ladder-guards", guards);
+    }
+
+    function renderMoves(data) {
+      var body = document.getElementById("moves-body");
+      body.innerHTML = "";
+
+      [["15 seconds", data.move_15s], ["60 seconds", data.move_60s]].forEach(function (item) {
+        var row = document.createElement("tr");
+        var value = item[1];
+        cell(row, item[0]);
+        cell(row, formatPercent(value), value > 0 ? "gain" : value < 0 ? "loss" : "");
+        cell(row, value === null || value === undefined ? "—" : value > 0 ? "UP" : value < 0 ? "DOWN" : "FLAT");
+        body.appendChild(row);
+      });
+    }
+
+    function renderLog(entries) {
+      var body = document.getElementById("log-body");
+      body.innerHTML = "";
+
+      if (!entries || !entries.length) {
+        var row = document.createElement("tr");
+        var td = document.createElement("td");
+        td.colSpan = 7;
+        td.className = "empty";
+        td.textContent = "No trades recorded yet.";
+        row.appendChild(td);
+        body.appendChild(row);
+        return;
+      }
+
+      entries.forEach(function (entry) {
+        var row = document.createElement("tr");
+        cell(row, formatTime(entry.at));
+        cell(row, (entry.type || "—").toUpperCase() + (entry.mode === "dryrun" ? " (sim)" : ""));
+        cell(row, entry.ticker || "—");
+        cell(row, (entry.side || "—").toUpperCase());
+        cell(row, entry.count === null || entry.count === undefined ? "—" : String(entry.count));
+        cell(row, entry.price_cents === null || entry.price_cents === undefined ? "—" : entry.price_cents + "c");
+        var realized = entry.realized_cents;
+        cell(
+          row,
+          realized === null || realized === undefined ? "—" : formatCents(realized),
+          realized > 0 ? "gain" : realized < 0 ? "loss" : ""
+        );
+        body.appendChild(row);
+      });
+    }
+
+    function render(data) {
+      renderSignal(data.signal);
+      text("price", formatPrice(data.btc_usd));
+
+      var kalshi = data.kalshi || {};
+      text("market-title", kalshi.market_title || kalshi.status || "—");
+
+      renderPnl(data.trader);
+      renderLadder(data.trader);
+      renderMoves(data);
+      renderLog(data.trade_log);
+    }
+
+    // ------------------------------------------------------------ live data
+    // SSE first; fetch polling both as the pre-SSE warmup and as the fallback
+    // whenever the stream drops. Polling stops as soon as SSE messages flow.
+    var pollTimer = null;
+    var lastRenderAt = 0;
+
+    function setStatus(message) {
+      text("status", message);
+    }
+
+    function handlePayload(data, source) {
+      lastRenderAt = Date.now();
+      render(data);
+      setStatus(data.spot_connected
+        ? "BTC Feed: LIVE (" + source + ")"
+        : "BTC Feed: reconnecting");
+    }
+
+    async function pollOnce() {
       try {
-        const response = await fetch("/api/state", { cache: "no-store" });
-
-        if (!response.ok) {
-          throw new Error("Server unavailable");
-        }
-
-        const data = await response.json();
-        const signal = data.signal;
-        const actionElement = document.getElementById("action");
-
-        actionElement.textContent = signal.action;
-        actionElement.className = "";
-
-        if (signal.action.includes("UP")) {
-          actionElement.classList.add("up");
-        } else if (signal.action.includes("DOWN")) {
-          actionElement.classList.add("down");
-        } else {
-          actionElement.classList.add("neutral");
-        }
-
-        document.getElementById("confidence").textContent =
-          signal.confidence + "% confidence";
-
-        document.getElementById("reason").textContent = signal.reason;
-        document.getElementById("price").textContent = formatPrice(data.btc_usd);
-        document.getElementById("move15").textContent = formatPercent(data.move_15s);
-        document.getElementById("move60").textContent = formatPercent(data.move_60s);
-
-        document.getElementById("status").textContent =
-          data.spot_connected ? "BTC Feed: LIVE" : "BTC Feed: reconnecting";
+        var response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) throw new Error("Server unavailable");
+        handlePayload(await response.json(), "polling");
       } catch (error) {
-        document.getElementById("status").textContent = "Dashboard reconnecting";
+        setStatus("Dashboard reconnecting");
       }
     }
 
-    updateDashboard();
-    setInterval(updateDashboard, 1000);
+    function startPolling() {
+      if (pollTimer) return;
+      pollOnce();
+      pollTimer = setInterval(pollOnce, 2000);
+    }
+
+    function stopPolling() {
+      if (!pollTimer) return;
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    function startStream() {
+      if (!window.EventSource) {
+        startPolling();
+        return;
+      }
+
+      var source = new EventSource("/api/stream");
+
+      source.onmessage = function (event) {
+        stopPolling();
+        try {
+          handlePayload(JSON.parse(event.data), "sse");
+        } catch (error) {
+          /* one malformed frame is not worth tearing the stream down */
+        }
+      };
+
+      // EventSource reconnects on its own; polling covers the gap and stops
+      // again the moment stream messages resume.
+      source.onerror = function () {
+        startPolling();
+      };
+    }
+
+    // Watchdog: if nothing has rendered for 10s regardless of transport,
+    // force polling back on.
+    setInterval(function () {
+      if (Date.now() - lastRenderAt > 10000) startPolling();
+    }, 5000);
+
+    startPolling();
+    startStream();
   </script>
 </body>
 </html>
