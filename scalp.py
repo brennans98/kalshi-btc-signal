@@ -42,6 +42,7 @@ def _blank_tier_hits():
 def _blank():
     return {
         "lots": {},
+        "pending": {},
         "stats": {
             "round_trips": 0,
             "tier_hits": _blank_tier_hits(),
@@ -67,6 +68,7 @@ def load(mode):
 
     blank = _blank()
     state.setdefault("lots", {})
+    state.setdefault("pending", {})
     stats = blank["stats"]
     stats.update(state.get("stats") or {})
     tier_hits = dict(blank["stats"]["tier_hits"])
@@ -107,6 +109,77 @@ def get(mode, lot_key):
     lot = dict(lot)
     lot["key"] = lot_key
     return lot
+
+
+def update_lot(mode, lot_key, fields):
+    """Merge fields into a lot and persist. Returns the updated lot or None."""
+    state = load(mode)
+    lot = (state.get("lots") or {}).get(lot_key)
+    if not lot:
+        return None
+    lot.update(fields)
+    save(mode, state)
+    lot = dict(lot)
+    lot["key"] = lot_key
+    return lot
+
+
+# ---- pending maker entries -------------------------------------------------
+# A resting entry order is not a position yet. It is tracked here, keyed like
+# a lot (ticker|side), so a restart can keep polling it and the risk gate can
+# refuse to stack a second attempt on the same market. Every pending order
+# carries an expiration_time on Kalshi's side, so an abandoned record can
+# never leave a live order on the book indefinitely.
+
+
+def pending_all(mode):
+    return {key_: dict(value) for key_, value in (load(mode).get("pending") or {}).items()}
+
+
+def pending_put(mode, pending_key, data):
+    state = load(mode)
+    state.setdefault("pending", {})[pending_key] = data
+    save(mode, state)
+
+
+def pending_del(mode, pending_key):
+    state = load(mode)
+    if pending_key in (state.get("pending") or {}):
+        state["pending"].pop(pending_key)
+        save(mode, state)
+
+
+def ladder_allocation(count):
+    """Split a position across the profit tiers: [(tier, contracts), ...].
+
+    Same arithmetic the taker plan() uses: cumulative percentages of the
+    original size, floor-rounded, with the last tier absorbing the remainder
+    so every contract is assigned. A position too small to split three ways
+    goes whole onto the small-lot exit tier.
+    """
+    cfg = config.settings
+    if count <= 0:
+        return []
+    if count < 3:
+        return [(cfg.tier(cfg.small_lot_exit_tier), count)]
+
+    tiers = cfg.tiers()
+    result = []
+    allocated = 0
+    cumulative = 0
+
+    for index, tier in enumerate(tiers):
+        cumulative += tier.pct
+        if index == len(tiers) - 1:
+            share = count - allocated
+        else:
+            share = max(0, math.floor(count * cumulative / 100) - allocated)
+        share = min(share, count - allocated)
+        if share > 0:
+            result.append((tier, share))
+        allocated += share
+
+    return result
 
 
 def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
@@ -169,11 +242,15 @@ def mark(mode, lot_key, bid):
     return lot
 
 
-def plan(lot, bid, now=None):
+def plan(lot, bid, now=None, include_profit=True):
     """Return the exit intents this lot warrants at the current bid.
 
     Each intent: {tier, count, limit_price, reason, kind}. kind is 'profit' for
     a ladder rung and 'stop' / 'trail' / 'time' otherwise.
+
+    include_profit=False is the maker-exit mode: profit rungs already rest on
+    the book as post-only asks, so plan() only watches for the exits that must
+    cross immediately -- stop, trail, settlement guard and max hold.
     """
     cfg = config.settings
     now = now or time.time()
@@ -222,6 +299,9 @@ def plan(lot, bid, now=None):
             "trail",
             f"Trailing exit: gave back {peak - gain:.0f}c from a {peak:.0f}c peak",
         )
+
+    if not include_profit:
+        return []
 
     # --- the profit ladder ----------------------------------------------
     tiers = cfg.tiers()
@@ -371,6 +451,24 @@ def view(mode):
             }
         )
 
+    pending = []
+    for pending_key, entry in pending_all(mode).items():
+        pending.append(
+            {
+                "key": pending_key,
+                "ticker": entry.get("ticker"),
+                "side": entry.get("side"),
+                "count": entry.get("count"),
+                "price_cents": entry.get("price_cents"),
+                "filled": entry.get("filled_recorded") or 0,
+                "expires_in_seconds": (
+                    max(0, int(entry["expire_epoch"] - time.time()))
+                    if entry.get("expire_epoch")
+                    else None
+                ),
+            }
+        )
+
     return {
         "ladder": [
             {"name": tier.name, "target_cents": tier.cents, "exit_pct": tier.pct}
@@ -378,6 +476,9 @@ def view(mode):
         ],
         "stop_cents": cfg.stop_cents,
         "trail_cents": cfg.trail_cents,
+        "entry_style": cfg.entry_style,
+        "exit_style": cfg.exit_style,
         "open": lots,
+        "pending_entries": pending,
         "stats": stats(mode),
     }
