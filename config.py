@@ -68,7 +68,7 @@ class Settings:
     key_id: str = field(default_factory=lambda: _str("KALSHI_API_KEY_ID", ""))
     private_key_pem: str = field(default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY", ""))
     series_ticker: str = field(default_factory=lambda: _str("KALSHI_SERIES_TICKER", "KXBTC15M"))
-    order_path: str = field(default_factory=lambda: _str("KALSHI_ORDER_PATH", "/portfolio/orders"))
+    order_path: str = field(default_factory=lambda: _str("KALSHI_ORDER_PATH", "/portfolio/events/orders"))
     admin_token: str = field(default_factory=lambda: _str("ADMIN_TOKEN", ""))
     data_dir: str = field(default_factory=lambda: _str("DATA_DIR", "./data"))
 
