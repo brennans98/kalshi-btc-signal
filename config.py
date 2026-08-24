@@ -94,6 +94,15 @@ class Settings:
     min_history_seconds: int = field(default_factory=lambda: _int("MIN_HISTORY_SECONDS", 120))
     stale_feed_seconds: float = field(default_factory=lambda: _float("STALE_FEED_SECONDS", 5.0))
 
+    # ---- fees ------------------------------------------------------------
+    # Kalshi charges ceil(0.07 * C * P * (1-P) * 100) cents per fill. This adds
+    # a cushion above the raw fee estimate before an edge is considered
+    # tradable, so a fee-rounding quirk or a slightly-stale price doesn't turn
+    # a marginal "profitable" trade into a guaranteed loss.
+    fee_safety_margin_cents: float = field(
+        default_factory=lambda: _float("FEE_SAFETY_MARGIN_CENTS", 0.5)
+    )
+
     # ---- the profit ladder ---------------------------------------------
     # Three targets, hit in order, each selling part of the position. The
     # small rung banks something quickly and takes the trade off risk; the
