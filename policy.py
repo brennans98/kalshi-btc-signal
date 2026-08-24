@@ -24,7 +24,7 @@ small target" is debuggable; a bare NO TRADE is not.
 
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 import config
 
