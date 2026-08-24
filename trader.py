@@ -84,7 +84,7 @@ def snapshot():
     payload["trades_today"] = state.get("trades_today", 0)
     payload["cost_today_cents"] = state.get("cost_today_cents", 0)
     payload["day_start_balance_cents"] = state.get("day_start_balance_cents")
-    payload["drawdown_cents"] = risk.drawdown_cents(status.get("balance_cents"), state=state)
+    payload["drawdown_cents"] = risk.drawdown_cents(_equity_cents(), state=state)
     payload["scalp"] = scalp.view(active if active != "off" else "dryrun")
     return payload
 
@@ -944,6 +944,38 @@ async def run_entry(client, signal, market):
     }
 
 
+def _equity_cents():
+    """Cash plus what deployed money is still worth, at cost.
+
+    The daily loss limit must measure losses, not deployment. Kalshi's cash
+    balance drops by the full entry cost while a lot is open, and by the
+    resting cost while a maker bid waits on the book. On a small account that
+    dip alone can exceed the loss limit, which once halted the day seconds
+    after a perfectly healthy first trade. Marking open lots and resting
+    entries at cost keeps the check focused on realized losses; an adverse
+    move is realized by the stop within seconds anyway, while a false halt
+    latches until midnight.
+
+    The cash snapshot refreshes on reconcile (every RECONCILE_SECONDS), so
+    equity can briefly double-count a fresh fill until the next refresh.
+    That slack only delays a legitimate halt by at most one reconcile
+    interval; it cannot cause a false one.
+    """
+    cash = status.get("balance_cents")
+    if cash is None:
+        return None
+
+    total = int(cash)
+    for lot in scalp.open_lots("live"):
+        total += int((lot.get("count_open") or 0) * (lot.get("entry_price") or 0))
+    for pending in scalp.pending_all("live").values():
+        resting = int(pending.get("count") or 0) - int(pending.get("filled_recorded") or 0)
+        if resting > 0:
+            total += resting * int(pending.get("price_cents") or 0)
+
+    return total
+
+
 async def tick(client, signal_provider, market_provider):
     status["last_tick_at"] = int(time.time())
 
@@ -953,8 +985,9 @@ async def tick(client, signal_provider, market_provider):
     await run_exits(client)
 
     # Evaluate the daily loss limit every tick, independent of whether a BUY
-    # signal exists this cycle. See module docstring.
-    risk.check_halt(status.get("balance_cents"))
+    # signal exists this cycle. Measured on equity, not cash: cash dips by
+    # the entry cost of every open position, which is deployment, not loss.
+    risk.check_halt(_equity_cents())
 
     if risk.is_halted():
         state = risk.load_state()
