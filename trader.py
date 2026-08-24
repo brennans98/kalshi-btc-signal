@@ -151,7 +151,8 @@ async def reconcile(client):
 
     open_positions = []
     for entry in positions.get("market_positions", []):
-        quantity = int(entry.get("position") or 0)
+        # V2 responses may express positions as fixed-point strings ("6.00").
+        quantity = int(float(entry.get("position") or 0))
         if quantity == 0:
             continue
 
@@ -252,13 +253,14 @@ async def _execute_exit(client, active, lot, intent):
 
     if active == "live":
         try:
-            record["response"] = await client.sell(
+            response = await client.sell(
                 ticker=ticker,
                 side=side,
                 count=count,
                 price_cents=price,
                 client_order_id=_order_id("exit"),
             )
+            record["response"] = response
         except KalshiAuthError as error:
             risk.halt(f"Authentication rejected while exiting {ticker}: {error}")
             record["outcome"] = "auth_error"
@@ -274,6 +276,18 @@ async def _execute_exit(client, active, lot, intent):
             status["last_error"] = str(error)
             risk.log_decision(record)
             return
+
+        # IOC can fill partially. Record only what actually sold; the rest of
+        # the lot stays open and is retried next tick. Zero fill means the bid
+        # vanished -- leave the whole lot open.
+        filled = client.filled_count(response)
+        if filled <= 0:
+            record["outcome"] = "exit_unfilled"
+            record["filled"] = 0
+            risk.log_decision(record)
+            return
+        count = min(count, filled)
+        record["filled"] = filled
 
     realized = scalp.record_exit(
         active, lot["key"], intent["tier"], intent["kind"], count, price
@@ -332,13 +346,14 @@ async def run_entry(client, signal, market):
 
     if active == "live":
         try:
-            record["response"] = await client.create_order(
+            response = await client.create_order(
                 ticker=ticker,
                 side=side,
                 count=count,
                 price_cents=price,
                 client_order_id=_order_id("entry"),
             )
+            record["response"] = response
         except KalshiAuthError as error:
             risk.halt(f"Authentication rejected during entry: {error}")
             record["outcome"] = "auth_error"
@@ -352,6 +367,22 @@ async def run_entry(client, signal, market):
             record["error"] = str(error)
             status["last_error"] = str(error)
             status["last_decision"] = {"outcome": "order_error", "reason": str(error)}
+            risk.log_decision(record)
+            return
+
+        # V2 returns 201 even when a fill-or-kill order is killed unfilled.
+        # An unfilled entry is not a trade: no lot, no cooldown, no daily count.
+        filled = client.filled_count(response)
+        if filled < count:
+            record["outcome"] = "unfilled"
+            record["filled"] = filled
+            status["last_decision"] = {
+                "outcome": "unfilled",
+                "reason": (
+                    f"FOK entry killed unfilled ({filled}/{count} "
+                    f"{side} @ {price}c on {ticker})"
+                ),
+            }
             risk.log_decision(record)
             return
 
