@@ -581,8 +581,12 @@ async def api_halt(x_admin_token: str = Header(default="")):
 
 @app.post("/api/trader/resume")
 async def api_resume(x_admin_token: str = Header(default="")):
+    """Clear a halt and restart the day's loss accounting from the current
+    balance. Resuming is a human decision that the account may trade again;
+    measuring the day from the balance that person just looked at keeps the
+    loss limit honest after deposits (see risk.resume)."""
     require_admin(x_admin_token)
-    return risk.resume()
+    return risk.resume(rebaseline_balance=trader.status.get("balance_cents"))
 
 
 @app.post("/api/trader/flatten")
