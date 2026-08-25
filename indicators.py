@@ -120,6 +120,15 @@ def analyze(trades):
     else:
         trend = "flat"
 
+    # Support and resistance: the extremes of the recent tape. A chartist
+    # does not buy into a ceiling or sell into a floor -- price approaching
+    # a recent extreme from below/above tends to stall there, and the few
+    # cents of stall are this bot's entire trade. A BREAK of the level
+    # (spot at or beyond it) is the opposite read and is not blocked.
+    sr_series = closes(trades, window_seconds=cfg.sr_lookback_seconds)
+    recent_high = max(sr_series) if sr_series else None
+    recent_low = min(sr_series) if sr_series else None
+
     return {
         "trend": trend,
         "ema_fast": fast,
@@ -127,4 +136,6 @@ def analyze(trades):
         "separation_bps": round(separation_bps, 2),
         "rsi": round(strength, 1),
         "bars": len(series),
+        "recent_high": recent_high,
+        "recent_low": recent_low,
     }
