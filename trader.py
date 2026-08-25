@@ -736,12 +736,18 @@ async def reconcile(client):
     return open_positions
 
 
-async def run_exits(client):
-    """Walk every open lot through the ladder, stops and guards."""
+async def run_exits(client, signal=None):
+    """Walk every open lot through the ladder, stops, chart flips and guards.
+
+    signal carries the live chart read; its trend feeds the chart-flip exit.
+    The trend is read off the BTC tape, not any one market, so it applies to
+    every KXBTC15M lot regardless of ticker.
+    """
     active = mode()
     if active == "off":
         return
 
+    trend = (signal or {}).get("trend")
     maker_exits = active == "live" and config.settings.exit_style == "maker"
     pending = scalp.pending_all("live") if active == "live" else {}
 
@@ -777,7 +783,7 @@ async def run_exits(client):
         if not marked:
             continue
 
-        intents = scalp.plan(marked, bid, include_profit=not maker_exits)
+        intents = scalp.plan(marked, bid, include_profit=not maker_exits, trend=trend)
         if not intents:
             continue
 
@@ -795,7 +801,7 @@ async def run_exits(client):
             marked = await _cancel_exit_orders(client, marked)
             if (marked.get("count_open") or 0) <= 0:
                 continue
-            intents = scalp.plan(marked, bid, include_profit=False)
+            intents = scalp.plan(marked, bid, include_profit=False, trend=trend)
 
         for intent in intents:
             await _execute_exit(client, active, marked, intent)
@@ -923,7 +929,15 @@ async def run_entry(client, signal, market):
     price = int(signal["price_cents"])
     count = sizing["count"]
 
-    if active == "live" and config.settings.entry_style == "maker":
+    # A late settlement snipe always enters as a taker: a resting post-only
+    # bid has no time to fill this close to settlement, and an unfilled
+    # "near-certainty" is just a missed one. Everything else honors
+    # entry_style as configured.
+    if (
+        active == "live"
+        and config.settings.entry_style == "maker"
+        and not signal.get("late_settlement")
+    ):
         await _place_maker_entry(client, signal, market, record, sizing)
         return
 
@@ -983,6 +997,7 @@ async def run_entry(client, signal, market):
         price,
         policy.close_epoch(market),
         stop_cents=signal.get("stop_cents"),
+        settle_only=bool(signal.get("late_settlement")),
     )
 
     targets = signal.get("scalp_targets") or {}
@@ -1049,7 +1064,7 @@ async def tick(client, signal_provider, market_provider):
     # then protect (and the adverse-selection guard needs the fresh signal).
     # Then exits, always before entries. See module docstring.
     await _poll_pending_entries(client, signal)
-    await run_exits(client)
+    await run_exits(client, signal)
 
     # Evaluate the daily loss limit every tick, independent of whether a BUY
     # signal exists this cycle. Measured on equity, not cash: cash dips by
