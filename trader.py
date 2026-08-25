@@ -163,6 +163,7 @@ def _record_pending_fills(pending_key, pending, filled_total):
         price,
         pending.get("close_epoch"),
         stop_cents=pending.get("stop_cents"),
+        settle_only=bool(pending.get("settle_only")),
     )
     pending["filled_recorded"] = filled_total
 
@@ -514,6 +515,7 @@ async def _place_maker_entry(client, signal, market, record, sizing):
         "filled_recorded": 0,
         "trade_counted": False,
         "stop_cents": signal.get("stop_cents"),
+        "settle_only": bool(signal.get("favorite") or signal.get("late_settlement")),
         "fair_cents": None if fair_prob is None else round(fair_prob * 100.0, 1),
     }
     scalp.pending_put("live", scalp.key(ticker, side), pending)
@@ -1094,7 +1096,7 @@ async def run_entry(client, signal, market):
         price,
         policy.close_epoch(market),
         stop_cents=signal.get("stop_cents"),
-        settle_only=bool(signal.get("late_settlement")),
+        settle_only=bool(signal.get("late_settlement") or signal.get("favorite")),
     )
 
     targets = signal.get("scalp_targets") or {}
