@@ -184,6 +184,17 @@ class Settings:
     late_min_fair_prob: float = field(default_factory=lambda: _float("LATE_MIN_FAIR_PROB", 0.93))
     late_max_price_cents: int = field(default_factory=lambda: _int("LATE_MAX_PRICE_CENTS", 96))
 
+    # Favorite buying: when the scalp path declines a market, buy the strong
+    # side at 75-92c if the model still says it is underpriced, rest a free
+    # maker bid, and hold to fee-free settlement. High win rate, full premium
+    # at risk on each loss -- the other half of the strategy split.
+    favorite_entry: int = field(default_factory=lambda: _int("FAV_ENTRY", 1))
+    fav_min_price_cents: int = field(default_factory=lambda: _int("FAV_MIN_PRICE_CENTS", 75))
+    fav_max_price_cents: int = field(default_factory=lambda: _int("FAV_MAX_PRICE_CENTS", 92))
+    fav_min_edge_cents: float = field(default_factory=lambda: _float("FAV_MIN_EDGE_CENTS", 1.5))
+    fav_min_fair_prob: float = field(default_factory=lambda: _float("FAV_MIN_FAIR_PROB", 0.80))
+    fav_risk_pct: int = field(default_factory=lambda: _int("FAV_RISK_PCT", 20))
+
     # ---- the exits that are not profits --------------------------------
     # stop_cents is the FALLBACK stop, used when a lot carries no stop of its
     # own (adopted positions, lots from before this feature). New entries get
@@ -381,6 +392,16 @@ class Settings:
             issues.append("SR_LOOKBACK_SECONDS must be at least 60")
         if self.sr_buffer_sigma < 0:
             issues.append("SR_BUFFER_SIGMA must be >= 0")
+        if not 1 <= self.fav_risk_pct <= 100:
+            issues.append("FAV_RISK_PCT must be between 1 and 100")
+        if not 50 <= self.fav_min_price_cents <= self.fav_max_price_cents <= 99:
+            issues.append(
+                "FAV_MIN/MAX_PRICE_CENTS must satisfy 50 <= min <= max <= 99"
+            )
+        if not 0.5 <= self.fav_min_fair_prob <= 0.99:
+            issues.append("FAV_MIN_FAIR_PROB must be between 0.5 and 0.99")
+        if self.fav_min_edge_cents < 0:
+            issues.append("FAV_MIN_EDGE_CENTS cannot be negative")
         if self.late_min_seconds < 15:
             issues.append("LATE_MIN_SECONDS must be at least 15 (orders need time to land)")
         if not 0.5 <= self.late_min_fair_prob <= 0.99:
@@ -439,6 +460,12 @@ class Settings:
             "late_min_seconds": self.late_min_seconds,
             "late_min_fair_prob": self.late_min_fair_prob,
             "late_max_price_cents": self.late_max_price_cents,
+            "favorite_entry": bool(self.favorite_entry),
+            "fav_min_price_cents": self.fav_min_price_cents,
+            "fav_max_price_cents": self.fav_max_price_cents,
+            "fav_min_edge_cents": self.fav_min_edge_cents,
+            "fav_min_fair_prob": self.fav_min_fair_prob,
+            "fav_risk_pct": self.fav_risk_pct,
             "entry_style": self.entry_style,
             "exit_style": self.exit_style,
             "maker_improve_cents": self.maker_improve_cents,
