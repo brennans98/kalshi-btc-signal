@@ -346,8 +346,10 @@ def check(signal, balance_cents, open_position_count, open_tickers):
 
     # Never size beyond what the exit side can absorb. Entering 6 contracts
     # against a 2-lot bid means the ladder cannot sell what it just bought.
+    # The exit-liquidity cap protects round trips; a late settlement snipe
+    # never exits, so the resting bid's depth is irrelevant to it.
     exit_size = signal.get("exit_bid_size")
-    if isinstance(exit_size, int) and exit_size > 0:
+    if not signal.get("late_settlement") and isinstance(exit_size, int) and exit_size > 0:
         count = min(count, exit_size)
 
     if count < 1:
