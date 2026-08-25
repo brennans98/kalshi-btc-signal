@@ -456,19 +456,55 @@ def evaluate(trades, market, orderbook):
         "stop_cents": stop_cents,
         "stop_price_cents": max(1, ask - stop_cents),
         "late_settlement": late_window,
+        "favorite": False,
     }
+
+    # ---- the favorite fallback ------------------------------------------
+    # The second strategy of the split: when the scalp path declines this
+    # market at any gate below, buy the strong side at 75-92c if the model
+    # still prices it above the ask, the trend is not actively opposing, and
+    # hold to fee-free settlement (maker entry, zero fees, full premium at
+    # risk). Computed here, used as the fallback return of every scalp gate.
+    favorite = None
+    if (
+        not late_window
+        and cfg.favorite_entry
+        and chart is not None
+        and maker_entry_price is not None
+        and cfg.fav_min_price_cents <= ask <= cfg.fav_max_price_cents
+        and prob >= cfg.fav_min_fair_prob
+        and edge >= cfg.fav_min_edge_cents
+        and chart["trend"] != ("down" if side == "yes" else "up")
+    ):
+        favorite = {
+            "action": f"BUY {side.upper()}",
+            "confidence": confidence,
+            "reason": (
+                f"Favorite: fair {prob * 100:.1f}% vs {ask}c ask ({edge:.1f}c edge), "
+                f"trend '{chart['trend']}' not opposing -- maker entry, held to "
+                f"settlement for the fee-free 100c, full premium at risk"
+            ),
+        }
+        favorite.update(diagnostics)
+        favorite["favorite"] = True
+        favorite["stop_cents"] = ask
+        favorite["stop_price_cents"] = None
 
     # The price band and exit-liquidity gates protect round trips. A late
     # settlement snipe never exits -- it buys 90+c contracts on purpose --
     # so those two gates do not apply to it.
     if not late_window and not cfg.min_price_cents <= ask <= cfg.max_price_cents:
-        return _no_trade(f"Ask {ask}c is outside the tradable price band", **diagnostics)
+        return favorite or _no_trade(
+            f"Ask {ask}c is outside the tradable price band", **diagnostics
+        )
 
     if not late_window and exit_bid is None:
-        return _no_trade(f"No resting bid on {side}: could enter but not scalp out", **diagnostics)
+        return favorite or _no_trade(
+            f"No resting bid on {side}: could enter but not scalp out", **diagnostics
+        )
 
     if not late_window and exit_size < cfg.min_exit_liquidity:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Exit liquidity too thin ({exit_size} resting on the {side} bid, "
             f"{cfg.min_exit_liquidity} required)",
             **diagnostics,
@@ -477,14 +513,14 @@ def evaluate(trades, market, orderbook):
     min_required_edge = max(cfg.min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
 
     if edge < min_required_edge:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Edge {edge:.1f}c below the fee-adjusted minimum {min_required_edge:.1f}c "
             f"(fees ~{fee_cents_per_contract:.1f}c/contract round-trip)",
             **diagnostics,
         )
 
     if not late_window and efficiency is not None and efficiency < cfg.min_efficiency_ratio:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Chop filter: efficiency {efficiency:.2f} below {cfg.min_efficiency_ratio:.2f} "
             f"floor -- the tape is wiggling, not trending",
             **diagnostics,
@@ -537,7 +573,7 @@ def evaluate(trades, market, orderbook):
 
     wanted_trend = "up" if side == "yes" else "down"
     if chart["trend"] != wanted_trend:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Trend gate: chart reads '{chart['trend']}' "
             f"(EMA gap {chart['separation_bps']:+.1f}bps), "
             f"BUY {side.upper()} needs '{wanted_trend}'",
@@ -545,14 +581,14 @@ def evaluate(trades, market, orderbook):
         )
 
     if side == "yes" and chart["rsi"] >= cfg.rsi_overbought:
-        return _no_trade(
+        return favorite or _no_trade(
             f"RSI gate: {chart['rsi']:.0f} is overbought (>= {cfg.rsi_overbought:.0f}) -- "
             f"buying YES here is chasing an exhausted move",
             **diagnostics,
         )
 
     if side == "no" and chart["rsi"] <= cfg.rsi_oversold:
-        return _no_trade(
+        return favorite or _no_trade(
             f"RSI gate: {chart['rsi']:.0f} is oversold (<= {cfg.rsi_oversold:.0f}) -- "
             f"buying NO here is chasing an exhausted move",
             **diagnostics,
@@ -567,7 +603,7 @@ def evaluate(trades, market, orderbook):
     if side == "yes" and chart["recent_high"] is not None:
         headroom = chart["recent_high"] - spot
         if 0 < headroom < sr_buffer:
-            return _no_trade(
+            return favorite or _no_trade(
                 f"Resistance gate: spot ${spot:,.0f} is only ${headroom:,.0f} under the "
                 f"{cfg.sr_lookback_seconds // 60}min high ${chart['recent_high']:,.0f} "
                 f"(buffer ${sr_buffer:,.0f}) -- buying YES into a ceiling",
@@ -576,7 +612,7 @@ def evaluate(trades, market, orderbook):
     if side == "no" and chart["recent_low"] is not None:
         footroom = spot - chart["recent_low"]
         if 0 < footroom < sr_buffer:
-            return _no_trade(
+            return favorite or _no_trade(
                 f"Support gate: spot ${spot:,.0f} is only ${footroom:,.0f} above the "
                 f"{cfg.sr_lookback_seconds // 60}min low ${chart['recent_low']:,.0f} "
                 f"(buffer ${sr_buffer:,.0f}) -- buying NO into a floor",
@@ -584,12 +620,12 @@ def evaluate(trades, market, orderbook):
             )
 
     if confidence < cfg.min_confidence:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Confidence {confidence}% below the {cfg.min_confidence}% floor", **diagnostics
         )
 
     if move is not None and move < tiers[0].cents:
-        return _no_trade(
+        return favorite or _no_trade(
             f"Expected move {move:.1f}c cannot reach the {tiers[0].cents}c "
             f"small target within {int(horizon)}s",
             **diagnostics,
