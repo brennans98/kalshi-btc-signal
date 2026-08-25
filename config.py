@@ -155,6 +155,34 @@ class Settings:
     # EMA separation, in basis points of price, below which the trend call is
     # 'flat'. Keeps a crossing EMA pair from flapping the call bar to bar.
     trend_deadzone_bps: float = field(default_factory=lambda: _float("TREND_DEADZONE_BPS", 2.0))
+    # Support/resistance: entries are refused when spot sits just below the
+    # recent high (BUY YES into a ceiling) or just above the recent low
+    # (BUY NO into a floor). "Just" is measured in units of the tape's own
+    # expected one-minute move: SR_BUFFER_SIGMA x sigma(60s) x spot. Spot AT
+    # or BEYOND the level is a break, the opposite read, and is not blocked.
+    sr_lookback_seconds: int = field(default_factory=lambda: _int("SR_LOOKBACK_SECONDS", 600))
+    sr_buffer_sigma: float = field(default_factory=lambda: _float("SR_BUFFER_SIGMA", 1.0))
+    # Chart-flip exit: when the EMA trend turns against an open lot that is
+    # not in profit, cut it immediately instead of donating the rest of the
+    # stop distance. CHART_EXIT=0 disables; the max-gain bound keeps this
+    # away from winners (the trail and the ladder own those).
+    chart_exit: int = field(default_factory=lambda: _int("CHART_EXIT", 1))
+    chart_exit_max_gain_cents: int = field(
+        default_factory=lambda: _int("CHART_EXIT_MAX_GAIN_CENTS", 0)
+    )
+    # ---- late settlement window -----------------------------------------
+    # Inside MIN_SECONDS_TO_CLOSE a stop is fiction: there is no time or
+    # book left to exit into, so a wrong entry loses its entire premium.
+    # The only trade taken there is the settlement snipe: a near-certainty
+    # (model prob >= LATE_MIN_FAIR_PROB, trend agreeing) bought at a
+    # discount (ask <= LATE_MAX_PRICE_CENTS), entered as a taker, sized
+    # against its FULL premium as the risk, and held to fee-free settlement
+    # -- never exited early. LATE_ENTRY=0 disables; the final
+    # LATE_MIN_SECONDS are always off-limits (orders need time to land).
+    late_entry: int = field(default_factory=lambda: _int("LATE_ENTRY", 1))
+    late_min_seconds: int = field(default_factory=lambda: _int("LATE_MIN_SECONDS", 45))
+    late_min_fair_prob: float = field(default_factory=lambda: _float("LATE_MIN_FAIR_PROB", 0.93))
+    late_max_price_cents: int = field(default_factory=lambda: _int("LATE_MAX_PRICE_CENTS", 96))
 
     # ---- the exits that are not profits --------------------------------
     # stop_cents is the FALLBACK stop, used when a lot carries no stop of its
@@ -349,6 +377,16 @@ class Settings:
             issues.append("SETTLE_RIDE_MIN_BID_CENTS must be between 50 and 99")
         if self.entry_cancel_adverse_cents < 1:
             issues.append("ENTRY_CANCEL_ADVERSE_CENTS must be at least 1")
+        if self.sr_lookback_seconds < 60:
+            issues.append("SR_LOOKBACK_SECONDS must be at least 60")
+        if self.sr_buffer_sigma < 0:
+            issues.append("SR_BUFFER_SIGMA must be >= 0")
+        if self.late_min_seconds < 15:
+            issues.append("LATE_MIN_SECONDS must be at least 15 (orders need time to land)")
+        if not 0.5 <= self.late_min_fair_prob <= 0.99:
+            issues.append("LATE_MIN_FAIR_PROB must be between 0.5 and 0.99")
+        if not 50 <= self.late_max_price_cents <= 99:
+            issues.append("LATE_MAX_PRICE_CENTS must be between 50 and 99")
 
         return issues
 
@@ -393,6 +431,14 @@ class Settings:
             "settle_ride": bool(self.settle_ride),
             "settle_ride_min_bid_cents": self.settle_ride_min_bid_cents,
             "entry_cancel_adverse_cents": self.entry_cancel_adverse_cents,
+            "sr_lookback_seconds": self.sr_lookback_seconds,
+            "sr_buffer_sigma": self.sr_buffer_sigma,
+            "chart_exit": bool(self.chart_exit),
+            "chart_exit_max_gain_cents": self.chart_exit_max_gain_cents,
+            "late_entry": bool(self.late_entry),
+            "late_min_seconds": self.late_min_seconds,
+            "late_min_fair_prob": self.late_min_fair_prob,
+            "late_max_price_cents": self.late_max_price_cents,
             "entry_style": self.entry_style,
             "exit_style": self.exit_style,
             "maker_improve_cents": self.maker_improve_cents,
