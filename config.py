@@ -169,6 +169,21 @@ class Settings:
     # this exists for: stop, re-enter the same direction 30 seconds later,
     # stop again, re-enter again -- three stops inside two minutes of chop.
     stop_cooldown_seconds: int = field(default_factory=lambda: _int("STOP_COOLDOWN_SECONDS", 120))
+    # A market that keeps stopping us out is telling us the signal is wrong
+    # there right now. Cap entries per individual market so one chopping
+    # 15-minute window cannot be re-tried into the ground (the observed
+    # pattern: four entries into the same market, four stops).
+    max_entries_per_market: int = field(default_factory=lambda: _int("MAX_ENTRIES_PER_MARKET", 2))
+
+    # ---- chop filter -----------------------------------------------------
+    # Kaufman efficiency ratio of the BTC tape: |net move| / sum of |one-
+    # second moves| over the window. 1.0 is a straight line; a pure random
+    # walk over N one-second samples scores about sqrt(pi / (2N)) -- roughly
+    # 0.09 for a 180-second window. A momentum signal only has an edge when
+    # the tape is actually going somewhere, so entries require clearly more
+    # directionality than noise.
+    chop_window_seconds: int = field(default_factory=lambda: _int("CHOP_WINDOW_SECONDS", 180))
+    min_efficiency_ratio: float = field(default_factory=lambda: _float("MIN_EFFICIENCY_RATIO", 0.20))
 
     # ---- loop ----------------------------------------------------------
     loop_seconds: float = field(default_factory=lambda: _float("TRADE_LOOP_SECONDS", 2.0))
@@ -262,6 +277,12 @@ class Settings:
             issues.append("PER_TRADE_RISK_PCT must be between 1 and 100")
         if self.entry_rest_seconds < 2:
             issues.append("ENTRY_REST_SECONDS must be at least 2")
+        if self.max_entries_per_market < 1:
+            issues.append("MAX_ENTRIES_PER_MARKET must be at least 1")
+        if not 0 <= self.min_efficiency_ratio <= 1:
+            issues.append("MIN_EFFICIENCY_RATIO must be between 0 and 1")
+        if self.chop_window_seconds < 30:
+            issues.append("CHOP_WINDOW_SECONDS must be at least 30 to hold enough samples")
 
         return issues
 
@@ -290,6 +311,9 @@ class Settings:
             "max_open_positions": self.max_open_positions,
             "cooldown_seconds": self.cooldown_seconds,
             "stop_cooldown_seconds": self.stop_cooldown_seconds,
+            "max_entries_per_market": self.max_entries_per_market,
+            "chop_window_seconds": self.chop_window_seconds,
+            "min_efficiency_ratio": self.min_efficiency_ratio,
             "entry_style": self.entry_style,
             "exit_style": self.exit_style,
             "maker_improve_cents": self.maker_improve_cents,
