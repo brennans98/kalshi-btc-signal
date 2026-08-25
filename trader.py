@@ -348,6 +348,81 @@ async def _cancel_pending_entry(client, pending_key, pending, reason):
     )
 
 
+# Markets Kalshi is not accepting orders on yet (each new 15-minute market
+# rejects orders with market_not_found for its first minute or two even
+# though discovery already lists it). ticker -> epoch until which entry
+# attempts are deferred, so one rejection quiets the retry loop instead of
+# spamming hundreds of doomed orders.
+_unready_markets = {}
+
+
+def _defer_market(ticker, seconds=20):
+    now = time.time()
+    for key in [k for k, until in _unready_markets.items() if until <= now]:
+        _unready_markets.pop(key, None)
+    _unready_markets[ticker] = now + seconds
+
+
+def _market_warming(ticker, record, error):
+    """Handle Kalshi's market_not_found on a brand-new market: back off quietly."""
+    _defer_market(ticker)
+    record["outcome"] = "market_warming"
+    record["error"] = str(error)
+    record["risk_reason"] = "Kalshi is not accepting orders on this market yet"
+    status["last_decision"] = {
+        "outcome": "market_warming",
+        "reason": f"{ticker} not accepting orders yet; retrying shortly",
+    }
+    risk.log_decision(record)
+
+
+async def _settle_stale_lot(client, active, lot):
+    """Resolve a lot whose market closed: credit the settlement and free the slot.
+
+    A lot that rides to settlement (or that the guard could not flatten) never
+    gets an exit fill, so without this it lingers as a ghost position forever,
+    eating an open-position slot and hiding settlement wins from the stats.
+    """
+    ticker = lot["ticker"]
+    try:
+        market = await client.get_market(ticker)
+    except KalshiAuthError:
+        raise
+    except KalshiApiError as error:
+        status["last_error"] = f"Settlement check failed for {ticker}: {error}"
+        return
+
+    result = (market or {}).get("result") or ""
+    if result not in ("yes", "no"):
+        return  # Closed but not officially settled yet; try again next tick.
+
+    won = result == lot["side"]
+    count = lot.get("count_open") or 0
+    realized = scalp.record_exit(
+        active, lot["key"], "settlement", "settlement", count, 100 if won else 0
+    )
+    outcome = "settled_win" if won else "settled_loss"
+    reason = (
+        f"Market settled {result.upper()}: "
+        + ("collected the full 100c" if won else "expired worthless")
+        + f" ({realized:+d}c on {count})"
+    )
+    risk.log_decision(
+        {
+            "event": "exit",
+            "mode": active,
+            "ticker": ticker,
+            "side": lot["side"],
+            "tier": "settlement",
+            "kind": "settlement",
+            "count": count,
+            "reason": reason,
+            "outcome": outcome,
+        }
+    )
+    status["last_decision"] = {"outcome": outcome, "reason": f"{ticker}: {reason}"}
+
+
 async def _place_maker_entry(client, signal, market, record, sizing):
     """Rest a post-only bid instead of crossing the spread.
 
@@ -401,6 +476,9 @@ async def _place_maker_entry(client, signal, market, record, sizing):
         risk.log_decision(record)
         raise
     except KalshiApiError as error:
+        if "market_not_found" in str(error):
+            _market_warming(ticker, record, error)
+            return
         record["outcome"] = "order_error"
         record["error"] = str(error)
         status["last_error"] = str(error)
@@ -754,6 +832,13 @@ async def run_exits(client, signal=None):
     for lot in scalp.open_lots(active):
         ticker, side = lot["ticker"], lot["side"]
 
+        # A market that closed over two minutes ago can only be settled: no
+        # book, no exits, just the official result. Resolve and move on.
+        close = lot.get("close_epoch")
+        if close and time.time() - close > 120:
+            await _settle_stale_lot(client, active, lot)
+            continue
+
         try:
             snap = policy.book_snapshot(await _book(client, ticker))
         except KalshiAuthError:
@@ -896,6 +981,15 @@ async def run_entry(client, signal, market):
         status["last_decision"] = {"outcome": "no_signal", "reason": signal.get("reason")}
         return
 
+    # A market Kalshi just rejected with market_not_found is still warming
+    # up; retrying every tick only piles up doomed orders in the log.
+    if _unready_markets.get(signal.get("ticker"), 0) > time.time():
+        status["last_decision"] = {
+            "outcome": "market_warming",
+            "reason": f"{signal.get('ticker')} not accepting orders yet; retrying shortly",
+        }
+        return
+
     open_lots = scalp.open_lots(active)
     pending = scalp.pending_all("live") if active == "live" else {}
     open_tickers = [lot["ticker"] for lot in open_lots] + [
@@ -960,6 +1054,9 @@ async def run_entry(client, signal, market):
             risk.log_decision(record)
             raise
         except KalshiApiError as error:
+            if "market_not_found" in str(error):
+                _market_warming(ticker, record, error)
+                return
             record["outcome"] = "order_error"
             record["error"] = str(error)
             status["last_error"] = str(error)
