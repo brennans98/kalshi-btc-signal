@@ -78,6 +78,37 @@ def realized_vol_per_second(trades, window_seconds=None):
     return sigma if sigma > 0 else None
 
 
+def efficiency_ratio(trades, window_seconds=None):
+    """Kaufman efficiency ratio: |net move| / sum of |one-second moves|.
+
+    1.0 means price went somewhere in a straight line; a pure random walk
+    over N one-second samples scores about sqrt(pi / (2N)) (~0.09 for a
+    180-second window). evaluate() refuses to produce a BUY while this is
+    below the configured floor: a momentum model in a chopping tape
+    systematically buys local extremes and gets clipped by its own stop.
+    Returns None when the window holds too few samples to judge.
+    """
+    cfg = config.settings
+    window_seconds = window_seconds or cfg.chop_window_seconds
+
+    cutoff = time.time() - window_seconds
+    buckets = {}
+    for timestamp, price in trades:
+        if timestamp >= cutoff:
+            buckets[int(timestamp)] = price
+
+    if len(buckets) < 30:
+        return None
+
+    series = [buckets[key] for key in sorted(buckets)]
+    net = abs(series[-1] - series[0])
+    path = sum(abs(series[i] - series[i - 1]) for i in range(1, len(series)))
+
+    if path <= 0:
+        return 0.0
+    return net / path
+
+
 def standard_score(spot, strike, sigma_per_second, seconds_remaining):
     """The z of a driftless lognormal settling above strike."""
     if spot <= 0 or strike <= 0 or sigma_per_second <= 0 or seconds_remaining <= 0:
@@ -308,6 +339,8 @@ def evaluate(trades, market, orderbook):
     if sigma is None:
         return _no_trade("Insufficient one-second samples to estimate volatility")
 
+    efficiency = efficiency_ratio(trades)
+
     snapshot = book_snapshot(orderbook)
     yes_ask, no_ask = snapshot["yes_ask"], snapshot["no_ask"]
 
@@ -372,6 +405,7 @@ def evaluate(trades, market, orderbook):
         "seconds_to_close": int(remaining),
         "expected_move_cents": None if move is None else round(move, 2),
         "fee_cents_per_contract": round(fee_cents_per_contract, 2),
+        "efficiency_ratio": None if efficiency is None else round(efficiency, 3),
         "maker_entry_price_cents": maker_entry_price,
         "scalp_targets": {
             tier.name: min(99, ask + tier.cents) for tier in tiers
@@ -398,6 +432,13 @@ def evaluate(trades, market, orderbook):
         return _no_trade(
             f"Edge {edge:.1f}c below the fee-adjusted minimum {min_required_edge:.1f}c "
             f"(fees ~{fee_cents_per_contract:.1f}c/contract round-trip)",
+            **diagnostics,
+        )
+
+    if efficiency is not None and efficiency < cfg.min_efficiency_ratio:
+        return _no_trade(
+            f"Chop filter: efficiency {efficiency:.2f} below {cfg.min_efficiency_ratio:.2f} "
+            f"floor -- the tape is wiggling, not trending",
             **diagnostics,
         )
 
