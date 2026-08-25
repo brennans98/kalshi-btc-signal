@@ -337,9 +337,12 @@ def check(signal, balance_cents, open_position_count, open_tickers):
 
     # Bound the worst case of THIS trade, not just its cost: contracts times
     # the stop distance is what a stop-out actually takes from the account.
-    if balance_cents is not None and cfg.stop_cents > 0:
+    # The signal carries the volatility-scaled stop this entry will trade
+    # with; a wider stop means fewer contracts for the same risk budget.
+    stop_cents = int(signal.get("stop_cents") or cfg.stop_cents)
+    if balance_cents is not None and stop_cents > 0:
         risk_budget = int(balance_cents) * cfg.per_trade_risk_pct // 100
-        count = min(count, max(0, risk_budget // cfg.stop_cents))
+        count = min(count, max(0, risk_budget // stop_cents))
 
     # Never size beyond what the exit side can absorb. Entering 6 contracts
     # against a 2-lot bid means the ladder cannot sell what it just bought.
