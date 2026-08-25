@@ -122,6 +122,14 @@ class Settings:
     # purpose: a 15-minute market moves, and an entry that has not filled in
     # this window was priced for a book that no longer exists.
     entry_rest_seconds: int = field(default_factory=lambda: _int("ENTRY_REST_SECONDS", 20))
+    # Cancel a resting maker entry when the model's fair value moves this
+    # many cents against it while it rests. A resting bid that only fills
+    # after the tape turns is not a fill, it is adverse selection -- several
+    # live stops fired 3-6 seconds after the maker fill for exactly this
+    # reason.
+    entry_cancel_adverse_cents: int = field(
+        default_factory=lambda: _int("ENTRY_CANCEL_ADVERSE_CENTS", 4)
+    )
 
     # ---- the profit ladder ---------------------------------------------
     # Three targets, hit in order, each selling part of the position. The
@@ -134,8 +142,30 @@ class Settings:
     large_cents: int = field(default_factory=lambda: _int("SCALP_LARGE_CENTS", 14))
     large_pct: int = field(default_factory=lambda: _int("SCALP_LARGE_PCT", 20))
 
+    # ---- chart analysis --------------------------------------------------
+    # The chart read (indicators.py) that gates every entry. EMAs on bar
+    # closes define the trend; RSI defines exhaustion. An entry must agree
+    # with the trend and must not chase an exhausted move.
+    bar_seconds: int = field(default_factory=lambda: _int("CHART_BAR_SECONDS", 5))
+    ema_fast_seconds: int = field(default_factory=lambda: _int("EMA_FAST_SECONDS", 60))
+    ema_slow_seconds: int = field(default_factory=lambda: _int("EMA_SLOW_SECONDS", 240))
+    rsi_period: int = field(default_factory=lambda: _int("RSI_PERIOD", 14))
+    rsi_overbought: float = field(default_factory=lambda: _float("RSI_OVERBOUGHT", 70.0))
+    rsi_oversold: float = field(default_factory=lambda: _float("RSI_OVERSOLD", 30.0))
+    # EMA separation, in basis points of price, below which the trend call is
+    # 'flat'. Keeps a crossing EMA pair from flapping the call bar to bar.
+    trend_deadzone_bps: float = field(default_factory=lambda: _float("TREND_DEADZONE_BPS", 2.0))
+
     # ---- the exits that are not profits --------------------------------
+    # stop_cents is the FALLBACK stop, used when a lot carries no stop of its
+    # own (adopted positions, lots from before this feature). New entries get
+    # a volatility-scaled stop: STOP_VOL_MULT x the expected one-minute
+    # contract move, clamped to [STOP_MIN_CENTS, STOP_MAX_CENTS]. A fixed
+    # stop is noise-clipped in a fast tape and dead weight in a slow one.
     stop_cents: int = field(default_factory=lambda: _int("SCALP_STOP_CENTS", 6))
+    stop_min_cents: int = field(default_factory=lambda: _int("STOP_MIN_CENTS", 6))
+    stop_max_cents: int = field(default_factory=lambda: _int("STOP_MAX_CENTS", 14))
+    stop_vol_mult: float = field(default_factory=lambda: _float("STOP_VOL_MULT", 1.5))
     trail_cents: int = field(default_factory=lambda: _int("SCALP_TRAIL_CENTS", 3))
     max_hold_seconds: int = field(default_factory=lambda: _int("SCALP_MAX_HOLD_SECONDS", 300))
     settlement_guard_seconds: int = field(
@@ -146,6 +176,18 @@ class Settings:
     # A position too small to split three ways exits whole at this rung.
     small_lot_exit_tier: str = field(
         default_factory=lambda: _str("SCALP_SMALL_LOT_EXIT_TIER", "medium").lower()
+    )
+    # ---- riding winners to settlement ------------------------------------
+    # Settlement pays the full 100c fee-free. A position that is deep in the
+    # money when the settlement guard would normally flatten it (bid at or
+    # above SETTLE_RIDE_MIN_BID_CENTS and in profit) is held to settlement
+    # instead of sold: selling at 85c keeps 85c minus taker fees, settling
+    # keeps 100c. The ride is re-checked every tick -- if the bid slips below
+    # the floor, the position is flattened immediately with whatever book
+    # remains. SETTLE_RIDE=0 disables.
+    settle_ride: int = field(default_factory=lambda: _int("SETTLE_RIDE", 1))
+    settle_ride_min_bid_cents: int = field(
+        default_factory=lambda: _int("SETTLE_RIDE_MIN_BID_CENTS", 80)
     )
 
     # ---- size and risk limits ------------------------------------------
@@ -283,6 +325,30 @@ class Settings:
             issues.append("MIN_EFFICIENCY_RATIO must be between 0 and 1")
         if self.chop_window_seconds < 30:
             issues.append("CHOP_WINDOW_SECONDS must be at least 30 to hold enough samples")
+        if self.stop_min_cents < 1:
+            issues.append("STOP_MIN_CENTS must be at least 1")
+        if self.stop_max_cents < self.stop_min_cents:
+            issues.append("STOP_MAX_CENTS must be >= STOP_MIN_CENTS")
+        if self.stop_vol_mult <= 0:
+            issues.append("STOP_VOL_MULT must be positive")
+        if self.bar_seconds < 1:
+            issues.append("CHART_BAR_SECONDS must be at least 1")
+        if self.ema_fast_seconds >= self.ema_slow_seconds:
+            issues.append("EMA_FAST_SECONDS must be less than EMA_SLOW_SECONDS")
+        if self.ema_fast_seconds < 2 * self.bar_seconds:
+            issues.append("EMA_FAST_SECONDS must cover at least 2 bars")
+        if self.rsi_period < 2:
+            issues.append("RSI_PERIOD must be at least 2")
+        if not self.rsi_oversold < self.rsi_overbought:
+            issues.append("RSI_OVERSOLD must be below RSI_OVERBOUGHT")
+        if not 0 <= self.rsi_oversold <= 100 or not 0 <= self.rsi_overbought <= 100:
+            issues.append("RSI thresholds must be between 0 and 100")
+        if self.trend_deadzone_bps < 0:
+            issues.append("TREND_DEADZONE_BPS must be >= 0")
+        if not 50 <= self.settle_ride_min_bid_cents <= 99:
+            issues.append("SETTLE_RIDE_MIN_BID_CENTS must be between 50 and 99")
+        if self.entry_cancel_adverse_cents < 1:
+            issues.append("ENTRY_CANCEL_ADVERSE_CENTS must be at least 1")
 
         return issues
 
@@ -297,6 +363,9 @@ class Settings:
                 for tier in self.tiers()
             ],
             "stop_cents": self.stop_cents,
+            "stop_min_cents": self.stop_min_cents,
+            "stop_max_cents": self.stop_max_cents,
+            "stop_vol_mult": self.stop_vol_mult,
             "trail_cents": self.trail_cents,
             "max_hold_seconds": self.max_hold_seconds,
             "settlement_guard_seconds": self.settlement_guard_seconds,
@@ -314,6 +383,16 @@ class Settings:
             "max_entries_per_market": self.max_entries_per_market,
             "chop_window_seconds": self.chop_window_seconds,
             "min_efficiency_ratio": self.min_efficiency_ratio,
+            "bar_seconds": self.bar_seconds,
+            "ema_fast_seconds": self.ema_fast_seconds,
+            "ema_slow_seconds": self.ema_slow_seconds,
+            "rsi_period": self.rsi_period,
+            "rsi_overbought": self.rsi_overbought,
+            "rsi_oversold": self.rsi_oversold,
+            "trend_deadzone_bps": self.trend_deadzone_bps,
+            "settle_ride": bool(self.settle_ride),
+            "settle_ride_min_bid_cents": self.settle_ride_min_bid_cents,
+            "entry_cancel_adverse_cents": self.entry_cancel_adverse_cents,
             "entry_style": self.entry_style,
             "exit_style": self.exit_style,
             "maker_improve_cents": self.maker_improve_cents,
