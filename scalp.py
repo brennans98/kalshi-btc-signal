@@ -59,6 +59,7 @@ def _blank():
             "trail_exits": 0,
             "time_exits": 0,
             "chart_exits": 0,
+            "settlement_exits": 0,
             "realized_cents": 0,
             "wins": 0,
             "losses": 0,
@@ -465,6 +466,8 @@ def record_exit(mode, lot_key, tier, kind, count, exit_price):
         stats["time_exits"] = stats.get("time_exits", 0) + 1
     elif kind == "chart":
         stats["chart_exits"] = stats.get("chart_exits", 0) + 1
+    elif kind == "settlement":
+        stats["settlement_exits"] = stats.get("settlement_exits", 0) + 1
 
     if lot["count_open"] <= 0:
         stats["round_trips"] = stats.get("round_trips", 0) + 1
