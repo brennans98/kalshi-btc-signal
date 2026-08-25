@@ -333,10 +333,21 @@ def evaluate(trades, market, orderbook):
     if remaining is None:
         return _no_trade("Market close time is unavailable")
 
-    if remaining < cfg.min_seconds_to_close:
+    # Inside min_seconds_to_close normal scalping is over -- but the late
+    # settlement window may still be open: near-certainties bought at a
+    # discount and held to settlement (never exited). See config for the
+    # guardrails; the extra late-only gates live further down, after the
+    # side and fair value are known.
+    late_window = remaining < cfg.min_seconds_to_close
+    if late_window and not cfg.late_entry:
         return _no_trade(
             f"Too little runway to scalp ({remaining:.0f}s to close, "
             f"{cfg.min_seconds_to_close}s required)"
+        )
+    if late_window and remaining < cfg.late_min_seconds:
+        return _no_trade(
+            f"Late window shut ({remaining:.0f}s to close, orders need "
+            f"{cfg.late_min_seconds}s to land)"
         )
 
     if remaining > cfg.max_seconds_to_close:
@@ -394,10 +405,16 @@ def evaluate(trades, market, orderbook):
             min(cfg.stop_max_cents, int(round(cfg.stop_vol_mult * move_1min))),
         )
 
+    # A late entry risks its whole premium (no exit exists in the final
+    # seconds), so the stop IS the ask: sizing divides the risk budget by it,
+    # and the lot itself is settle-only.
+    if late_window:
+        stop_cents = ask
+
     count_estimate = max(1, cfg.max_contracts_per_trade)
     est_exit_price = exit_bid if exit_bid is not None else ask
-    entry_is_maker = cfg.entry_style == "maker"
-    exit_is_maker = cfg.exit_style == "maker"
+    entry_is_maker = cfg.entry_style == "maker" and not late_window
+    exit_is_maker = cfg.exit_style == "maker" and not late_window
     fee_cents_total = round_trip_fee_cents(
         count_estimate, ask, est_exit_price, entry_is_maker, exit_is_maker
     )
@@ -431,20 +448,26 @@ def evaluate(trades, market, orderbook):
         "trend": None if chart is None else chart["trend"],
         "ema_separation_bps": None if chart is None else chart["separation_bps"],
         "rsi": None if chart is None else chart["rsi"],
+        "recent_high": None if chart is None else chart["recent_high"],
+        "recent_low": None if chart is None else chart["recent_low"],
         "scalp_targets": {
             tier.name: min(99, ask + tier.cents) for tier in tiers
         },
         "stop_cents": stop_cents,
         "stop_price_cents": max(1, ask - stop_cents),
+        "late_settlement": late_window,
     }
 
-    if not cfg.min_price_cents <= ask <= cfg.max_price_cents:
+    # The price band and exit-liquidity gates protect round trips. A late
+    # settlement snipe never exits -- it buys 90+c contracts on purpose --
+    # so those two gates do not apply to it.
+    if not late_window and not cfg.min_price_cents <= ask <= cfg.max_price_cents:
         return _no_trade(f"Ask {ask}c is outside the tradable price band", **diagnostics)
 
-    if exit_bid is None:
+    if not late_window and exit_bid is None:
         return _no_trade(f"No resting bid on {side}: could enter but not scalp out", **diagnostics)
 
-    if exit_size < cfg.min_exit_liquidity:
+    if not late_window and exit_size < cfg.min_exit_liquidity:
         return _no_trade(
             f"Exit liquidity too thin ({exit_size} resting on the {side} bid, "
             f"{cfg.min_exit_liquidity} required)",
@@ -460,7 +483,7 @@ def evaluate(trades, market, orderbook):
             **diagnostics,
         )
 
-    if efficiency is not None and efficiency < cfg.min_efficiency_ratio:
+    if not late_window and efficiency is not None and efficiency < cfg.min_efficiency_ratio:
         return _no_trade(
             f"Chop filter: efficiency {efficiency:.2f} below {cfg.min_efficiency_ratio:.2f} "
             f"floor -- the tape is wiggling, not trending",
@@ -474,6 +497,43 @@ def evaluate(trades, market, orderbook):
         return _no_trade(
             "Chart warmup: not enough tape yet for the EMA/RSI read", **diagnostics
         )
+
+    if late_window:
+        # The settlement snipe replaces every momentum/mean-reversion gate:
+        # RSI exhaustion, S/R stalls and expected-move all reason about where
+        # price travels next, but this trade only needs price to stay put.
+        # A flat trend is fine; only an actively opposing trend disqualifies.
+        opposing = "down" if side == "yes" else "up"
+        if chart["trend"] == opposing:
+            return _no_trade(
+                f"Late window: trend reads '{opposing}' against BUY {side.upper()} -- "
+                f"a near-certainty with the tape moving against it is not one",
+                **diagnostics,
+            )
+        if prob < cfg.late_min_fair_prob:
+            return _no_trade(
+                f"Late window: fair {prob * 100:.1f}% is below the "
+                f"{cfg.late_min_fair_prob * 100:.0f}% certainty floor -- this close to "
+                f"settlement only near-certainties are bought",
+                **diagnostics,
+            )
+        if ask > cfg.late_max_price_cents:
+            return _no_trade(
+                f"Late window: ask {ask}c is above the {cfg.late_max_price_cents}c cap -- "
+                f"no discount left worth the settlement risk",
+                **diagnostics,
+            )
+        payload = {
+            "action": f"BUY {side.upper()}",
+            "confidence": confidence,
+            "reason": (
+                f"Settlement snipe: fair {prob * 100:.1f}% vs {ask}c ask with "
+                f"{remaining:.0f}s left, trend '{chart['trend']}' not opposing -- taker in, "
+                f"held to settlement for the fee-free 100c, full premium at risk"
+            ),
+        }
+        payload.update(diagnostics)
+        return payload
 
     wanted_trend = "up" if side == "yes" else "down"
     if chart["trend"] != wanted_trend:
@@ -497,6 +557,31 @@ def evaluate(trades, market, orderbook):
             f"buying NO here is chasing an exhausted move",
             **diagnostics,
         )
+
+    # Support/resistance: do not buy YES with a recent high sitting just
+    # overhead, or NO with a recent low just underfoot -- price tends to
+    # stall at the level it last rejected. Spot AT or BEYOND the level is a
+    # break, not a stall, and passes. The buffer scales with the tape's own
+    # expected one-minute move so it adapts to fast and slow tapes alike.
+    sr_buffer = cfg.sr_buffer_sigma * sigma * math.sqrt(60.0) * spot
+    if side == "yes" and chart["recent_high"] is not None:
+        headroom = chart["recent_high"] - spot
+        if 0 < headroom < sr_buffer:
+            return _no_trade(
+                f"Resistance gate: spot ${spot:,.0f} is only ${headroom:,.0f} under the "
+                f"{cfg.sr_lookback_seconds // 60}min high ${chart['recent_high']:,.0f} "
+                f"(buffer ${sr_buffer:,.0f}) -- buying YES into a ceiling",
+                **diagnostics,
+            )
+    if side == "no" and chart["recent_low"] is not None:
+        footroom = spot - chart["recent_low"]
+        if 0 < footroom < sr_buffer:
+            return _no_trade(
+                f"Support gate: spot ${spot:,.0f} is only ${footroom:,.0f} above the "
+                f"{cfg.sr_lookback_seconds // 60}min low ${chart['recent_low']:,.0f} "
+                f"(buffer ${sr_buffer:,.0f}) -- buying NO into a floor",
+                **diagnostics,
+            )
 
     if confidence < cfg.min_confidence:
         return _no_trade(
