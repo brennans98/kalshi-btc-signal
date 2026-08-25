@@ -62,6 +62,7 @@ def _blank_state():
         "halt_reason": None,
         "halt_is_manual": False,
         "tickers_traded": [],
+        "ticker_attempts": {},
     }
 
 
@@ -263,6 +264,15 @@ def record_trade(ticker, count, cost_cents):
         tickers.append(ticker)
     state["tickers_traded"] = tickers[-50:]
 
+    attempts = dict(state.get("ticker_attempts") or {})
+    attempts[ticker] = int(attempts.get(ticker, 0)) + 1
+    # Each 15-minute market has a unique ticker, so this map only grows;
+    # keep the most recent entries. Sorting by ticker works because the
+    # tickers embed their timestamp.
+    if len(attempts) > 100:
+        attempts = dict(sorted(attempts.items())[-100:])
+    state["ticker_attempts"] = attempts
+
     save_state(state)
     return state
 
@@ -292,6 +302,15 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     ticker = signal.get("ticker")
     if ticker and ticker in (open_tickers or []):
         return False, f"Already scalping {ticker}", None
+
+    # A market that already stopped us out is hostile to this signal right
+    # now; re-trying it over and over is how a chop session drains a day.
+    attempts = int((state.get("ticker_attempts") or {}).get(ticker) or 0)
+    if ticker and attempts >= cfg.max_entries_per_market:
+        return False, (
+            f"Market attempt cap: already entered {ticker} {attempts}x "
+            f"(max {cfg.max_entries_per_market} per market)"
+        ), None
 
     elapsed = time.time() - float(state.get("last_trade_at") or 0)
     if elapsed < cfg.cooldown_seconds:
