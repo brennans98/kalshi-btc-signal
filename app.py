@@ -688,6 +688,33 @@ async def api_flatten(x_admin_token: str = Header(default="")):
     return {"halted": True, "mode": lot_mode, "closed": closed}
 
 
+@app.get("/api/trader/fills")
+async def api_fills(x_admin_token: str = Header(default=""), limit: int = 200):
+    """Raw fills straight from Kalshi's records, for auditing what actually
+    traded. The bot's own logs describe intent; this endpoint is the ground
+    truth to reconcile them against (entries, exits, prices, fee treatment).
+    """
+    require_admin(x_admin_token)
+    try:
+        payload = await client.get_fills(limit=min(int(limit), 1000))
+    except (KalshiApiError, KalshiAuthError) as error:
+        return {"error": str(error)}
+    return payload
+
+
+@app.get("/api/trader/settlements")
+async def api_settlements(x_admin_token: str = Header(default=""), limit: int = 200):
+    """Settled-market results from Kalshi: what each position finally paid."""
+    require_admin(x_admin_token)
+    try:
+        payload = await client.request(
+            "GET", "/portfolio/settlements", params={"limit": min(int(limit), 1000)}
+        )
+    except (KalshiApiError, KalshiAuthError) as error:
+        return {"error": str(error)}
+    return payload
+
+
 @app.get("/api/trader/decisions")
 async def api_decisions(limit: int = 50, x_admin_token: str = Header(default="")):
     require_admin(x_admin_token)
