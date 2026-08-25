@@ -58,6 +58,7 @@ def _blank():
             "stop_exits": 0,
             "trail_exits": 0,
             "time_exits": 0,
+            "chart_exits": 0,
             "realized_cents": 0,
             "wins": 0,
             "losses": 0,
@@ -191,13 +192,20 @@ def ladder_allocation(count):
     return result
 
 
-def record_entry(mode, ticker, side, count, entry_price, close_epoch=None, stop_cents=None):
+def record_entry(
+    mode, ticker, side, count, entry_price, close_epoch=None, stop_cents=None, settle_only=False
+):
     """Open (or add to) a lot. Averages the basis if a lot already exists.
 
     stop_cents is the volatility-scaled stop the signal computed at entry
     time; it is stored on the lot so plan() honors the stop the trade was
     sized against, not whatever the config says later. Lots without one
     (adopted positions, pre-feature lots) fall back to SCALP_STOP_CENTS.
+
+    settle_only marks a late settlement snipe: the lot is never exited --
+    no stop, no ladder, no guard -- it rides to settlement by design, and
+    its premium was sized as the risk. Adding to a settle-only lot keeps
+    the flag; a normal add to a normal lot never sets it.
 
     Averaging into an existing lot moves the basis, which invalidates the
     ladder's prior progress: a tier marked "done" against the old basis may
@@ -219,6 +227,8 @@ def record_entry(mode, ticker, side, count, entry_price, close_epoch=None, stop_
         existing["close_epoch"] = close_epoch or existing.get("close_epoch")
         if stop_cents:
             existing["stop_cents"] = int(stop_cents)
+        if settle_only:
+            existing["settle_only"] = True
         existing["tiers_done"] = []
         existing["peak_gain"] = 0
         state["lots"][lot_key] = existing
@@ -232,6 +242,7 @@ def record_entry(mode, ticker, side, count, entry_price, close_epoch=None, stop_
             "opened_at": now,
             "close_epoch": close_epoch,
             "stop_cents": int(stop_cents) if stop_cents else None,
+            "settle_only": bool(settle_only),
             "tiers_done": [],
             "peak_gain": 0,
             "last_bid": entry_price,
@@ -275,21 +286,31 @@ def _riding_to_settlement(cfg, bid, gain):
     )
 
 
-def plan(lot, bid, now=None, include_profit=True):
+def plan(lot, bid, now=None, include_profit=True, trend=None):
     """Return the exit intents this lot warrants at the current bid.
 
     Each intent: {tier, count, limit_price, reason, kind}. kind is 'profit' for
-    a ladder rung and 'stop' / 'trail' / 'time' otherwise.
+    a ladder rung and 'stop' / 'trail' / 'chart' / 'time' otherwise.
+
+    trend is the live chart read ('up' / 'down' / 'flat' / None). When the
+    trend has flipped against a lot that is not in profit, the lot is cut
+    immediately (kind 'chart') instead of riding the full stop distance down:
+    the reason for holding no longer exists, so neither does the position.
 
     include_profit=False is the maker-exit mode: profit rungs already rest on
     the book as post-only asks, so plan() only watches for the exits that must
-    cross immediately -- stop, trail, settlement guard and max hold.
+    cross immediately -- stop, chart flip, trail, settlement guard, max hold.
     """
     cfg = config.settings
     now = now or time.time()
 
     remaining = lot.get("count_open") or 0
     if remaining <= 0 or bid is None:
+        return []
+
+    # A settlement snipe is never exited: its premium was the risk, its exit
+    # is settlement. Every stop/guard/ladder below is deliberately skipped.
+    if lot.get("settle_only"):
         return []
 
     entry = lot["entry_price"]
@@ -313,6 +334,18 @@ def plan(lot, bid, now=None, include_profit=True):
     # --- exits that override the ladder, in priority order ---------------
     if gain <= -stop_cents:
         return flatten("stop", f"Stop hit: {gain:.0f}c against a {stop_cents}c stop")
+
+    if cfg.chart_exit and trend in ("up", "down"):
+        opposed = (lot["side"] == "yes" and trend == "down") or (
+            lot["side"] == "no" and trend == "up"
+        )
+        if opposed and gain <= cfg.chart_exit_max_gain_cents:
+            return flatten(
+                "chart",
+                f"Chart flip: trend turned '{trend}' against this "
+                f"{lot['side'].upper()} lot at {gain:+.0f}c -- cutting now "
+                f"instead of riding to the {stop_cents}c stop",
+            )
 
     riding = _riding_to_settlement(cfg, bid, gain)
 
@@ -430,6 +463,8 @@ def record_exit(mode, lot_key, tier, kind, count, exit_price):
         stats["trail_exits"] = stats.get("trail_exits", 0) + 1
     elif kind == "time":
         stats["time_exits"] = stats.get("time_exits", 0) + 1
+    elif kind == "chart":
+        stats["chart_exits"] = stats.get("chart_exits", 0) + 1
 
     if lot["count_open"] <= 0:
         stats["round_trips"] = stats.get("round_trips", 0) + 1
@@ -484,8 +519,10 @@ def view(mode):
                 "bid_cents": bid,
                 "open_gain_cents": gain,
                 "peak_gain_cents": round(lot.get("peak_gain", 0), 1),
-                "stop_cents": lot.get("stop_cents") or cfg.stop_cents,
-                "riding_to_settlement": _riding_to_settlement(
+                "stop_cents": None if lot.get("settle_only") else (lot.get("stop_cents") or cfg.stop_cents),
+                "settle_only": bool(lot.get("settle_only")),
+                "riding_to_settlement": bool(lot.get("settle_only"))
+                or _riding_to_settlement(
                     cfg, bid, None if bid is None else bid - lot["entry_price"]
                 ),
                 "tiers_hit": lot.get("tiers_done") or [],
