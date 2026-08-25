@@ -162,6 +162,7 @@ def _record_pending_fills(pending_key, pending, filled_total):
         new_fill,
         price,
         pending.get("close_epoch"),
+        stop_cents=pending.get("stop_cents"),
     )
     pending["filled_recorded"] = filled_total
 
@@ -210,8 +211,33 @@ def _record_pending_fills(pending_key, pending, filled_total):
     return new_fill
 
 
-async def _poll_pending_entries(client):
-    """Advance resting maker entries: record fills, retire finished orders."""
+def _fair_cents_for(signal, pending):
+    """The model's CURRENT fair value, in cents, for a pending order's side.
+
+    The signal's fair_prob is quoted for whichever side the signal chose this
+    tick; flip it when the pending order sits on the other side. Returns None
+    when the signal is for a different market or carries no fair value.
+    """
+    if not signal or signal.get("ticker") != pending.get("ticker"):
+        return None
+    prob = signal.get("fair_prob")
+    if prob is None:
+        return None
+    fair = prob * 100.0
+    if signal.get("side") != pending.get("side"):
+        fair = 100.0 - fair
+    return fair
+
+
+async def _poll_pending_entries(client, signal=None):
+    """Advance resting maker entries: record fills, retire finished orders.
+
+    Also the adverse-selection guard: a resting bid whose fair value has
+    moved ENTRY_CANCEL_ADVERSE_CENTS against it since placement is pulled
+    rather than left to be filled by the very move that invalidated it.
+    Several live stop-outs fired 3-6 seconds after the maker fill -- the bid
+    was only hit because price was crashing through it.
+    """
     if mode() != "live":
         return
 
@@ -236,6 +262,34 @@ async def _poll_pending_entries(client):
 
         state_name, filled, remaining = client.order_progress(payload)
         _record_pending_fills(pending_key, pending, filled)
+
+        still_resting = (
+            state_name not in ("executed", "canceled") and remaining > 0 and not expired
+        )
+        if still_resting:
+            fair_now = _fair_cents_for(signal, pending)
+            fair_at_place = pending.get("fair_cents")
+            slip = (
+                None
+                if fair_now is None or fair_at_place is None
+                else fair_at_place - fair_now
+            )
+            if slip is not None and slip >= config.settings.entry_cancel_adverse_cents:
+                await _cancel_pending_entry(
+                    client,
+                    pending_key,
+                    pending,
+                    f"Adverse selection guard: fair value moved {slip:.0f}c against "
+                    f"the resting {pending.get('side')} bid since placement",
+                )
+                status["last_decision"] = {
+                    "outcome": "rest_canceled",
+                    "reason": (
+                        f"Pulled resting entry on {pending.get('ticker')}: fair value "
+                        f"moved {slip:.0f}c against it while it waited"
+                    ),
+                }
+            continue
 
         if state_name in ("executed", "canceled") or remaining <= 0 or expired:
             scalp.pending_del("live", pending_key)
@@ -369,6 +423,7 @@ async def _place_maker_entry(client, signal, market, record, sizing):
         risk.log_decision(record)
         return
 
+    fair_prob = signal.get("fair_prob")
     pending = {
         "order_id": order_id,
         "ticker": ticker,
@@ -380,6 +435,8 @@ async def _place_maker_entry(client, signal, market, record, sizing):
         "expire_epoch": expire,
         "filled_recorded": 0,
         "trade_counted": False,
+        "stop_cents": signal.get("stop_cents"),
+        "fair_cents": None if fair_prob is None else round(fair_prob * 100.0, 1),
     }
     scalp.pending_put("live", scalp.key(ticker, side), pending)
 
@@ -918,7 +975,15 @@ async def run_entry(client, signal, market):
     # trading never could, making the simulation misleading.
     risk.record_trade(ticker, count, sizing["cost_cents"])
 
-    scalp.record_entry(active, ticker, side, count, price, policy.close_epoch(market))
+    scalp.record_entry(
+        active,
+        ticker,
+        side,
+        count,
+        price,
+        policy.close_epoch(market),
+        stop_cents=signal.get("stop_cents"),
+    )
 
     targets = signal.get("scalp_targets") or {}
     record["outcome"] = "opened" if active == "live" else "simulated"
@@ -978,10 +1043,12 @@ def _equity_cents():
 
 async def tick(client, signal_provider, market_provider):
     status["last_tick_at"] = int(time.time())
+    signal = signal_provider()
 
     # Resting entries first: their fills create the lots the exit pass must
-    # then protect. Then exits, always before entries. See module docstring.
-    await _poll_pending_entries(client)
+    # then protect (and the adverse-selection guard needs the fresh signal).
+    # Then exits, always before entries. See module docstring.
+    await _poll_pending_entries(client, signal)
     await run_exits(client)
 
     # Evaluate the daily loss limit every tick, independent of whether a BUY
@@ -997,7 +1064,7 @@ async def tick(client, signal_provider, market_provider):
         }
         return
 
-    await run_entry(client, signal_provider(), market_provider())
+    await run_entry(client, signal, market_provider())
 
 
 async def loop(client, signal_provider, market_provider):
