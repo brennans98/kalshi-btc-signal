@@ -13,7 +13,8 @@ Three profit rungs, hit in order, each selling a share of the ORIGINAL size:
 
 And three exits that are not profits:
 
-    stop              price moves against us by more than the stop
+    stop              price moves against us by more than the lot's stop
+                      (volatility-scaled at entry; falls back to SCALP_STOP_CENTS)
     trailing stop     armed only after the first rung; gives back at most
                       trail_cents from the peak instead of round-tripping
     time / guard      max hold reached, or close enough to settlement that
@@ -22,6 +23,14 @@ And three exits that are not profits:
 The settlement guard is the important one. A 15-minute contract held to expiry
 is not a scalp, it is a coin flip with a spread paid on entry. The guard exits
 while there is still a book to sell into.
+
+One deliberate exception: a position that is DEEP in the money when the guard
+or the hold clock would flatten it rides to settlement instead. Selling at 85c
+keeps 85c minus taker fees; settlement keeps the full 100c fee-free. The live
+example that motivated this: the day's one winner was flattened at 85c by the
+guard on a market that settled in its favor -- holding would have paid +156c
+instead of +66c. The ride is re-checked every tick; if the bid slips below the
+floor the position flattens immediately with whatever book remains.
 
 Lots are persisted, keyed by ticker and side, so a container restart does not
 lose track of an open scalp or its ladder progress. Paper and live lots live in
@@ -182,8 +191,13 @@ def ladder_allocation(count):
     return result
 
 
-def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
+def record_entry(mode, ticker, side, count, entry_price, close_epoch=None, stop_cents=None):
     """Open (or add to) a lot. Averages the basis if a lot already exists.
+
+    stop_cents is the volatility-scaled stop the signal computed at entry
+    time; it is stored on the lot so plan() honors the stop the trade was
+    sized against, not whatever the config says later. Lots without one
+    (adopted positions, pre-feature lots) fall back to SCALP_STOP_CENTS.
 
     Averaging into an existing lot moves the basis, which invalidates the
     ladder's prior progress: a tier marked "done" against the old basis may
@@ -203,6 +217,8 @@ def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
         existing["count_open"] = held + count
         existing["count_original"] = existing.get("count_original", held) + count
         existing["close_epoch"] = close_epoch or existing.get("close_epoch")
+        if stop_cents:
+            existing["stop_cents"] = int(stop_cents)
         existing["tiers_done"] = []
         existing["peak_gain"] = 0
         state["lots"][lot_key] = existing
@@ -215,6 +231,7 @@ def record_entry(mode, ticker, side, count, entry_price, close_epoch=None):
             "entry_price": entry_price,
             "opened_at": now,
             "close_epoch": close_epoch,
+            "stop_cents": int(stop_cents) if stop_cents else None,
             "tiers_done": [],
             "peak_gain": 0,
             "last_bid": entry_price,
@@ -242,6 +259,22 @@ def mark(mode, lot_key, bid):
     return lot
 
 
+def _riding_to_settlement(cfg, bid, gain):
+    """True when this lot should be HELD through the guard to settlement.
+
+    Deep in the money (bid at or above the ride floor) and in profit:
+    the market itself is pricing a high probability of settling our way,
+    and settlement pays the full 100c with zero fees. Re-evaluated every
+    tick -- one bad print below the floor and the ride is over.
+    """
+    return (
+        bool(cfg.settle_ride)
+        and bid is not None
+        and gain > 0
+        and bid >= cfg.settle_ride_min_bid_cents
+    )
+
+
 def plan(lot, bid, now=None, include_profit=True):
     """Return the exit intents this lot warrants at the current bid.
 
@@ -263,6 +296,7 @@ def plan(lot, bid, now=None, include_profit=True):
     gain = bid - entry
     peak = max(lot.get("peak_gain", 0), gain)
     done = list(lot.get("tiers_done") or [])
+    stop_cents = int(lot.get("stop_cents") or cfg.stop_cents)
     limit_price = max(1, min(99, int(round(bid)) - cfg.exit_slippage_cents))
 
     def flatten(kind, reason, tier=None):
@@ -277,13 +311,20 @@ def plan(lot, bid, now=None, include_profit=True):
         ]
 
     # --- exits that override the ladder, in priority order ---------------
-    if gain <= -cfg.stop_cents:
-        return flatten("stop", f"Stop hit: {gain:.0f}c against a {cfg.stop_cents}c stop")
+    if gain <= -stop_cents:
+        return flatten("stop", f"Stop hit: {gain:.0f}c against a {stop_cents}c stop")
+
+    riding = _riding_to_settlement(cfg, bid, gain)
 
     seconds_left = None
     if lot.get("close_epoch"):
         seconds_left = lot["close_epoch"] - now
         if seconds_left <= cfg.settlement_guard_seconds:
+            if riding:
+                # Deep ITM: hold through settlement for the full fee-free
+                # 100c instead of selling the guard. Checked every tick;
+                # a bid below the floor flattens on the next pass.
+                return []
             return flatten(
                 "time",
                 f"Settlement guard: {int(seconds_left)}s to close, flattening "
@@ -291,7 +332,7 @@ def plan(lot, bid, now=None, include_profit=True):
             )
 
     held_for = now - (lot.get("opened_at") or now)
-    if held_for >= cfg.max_hold_seconds:
+    if held_for >= cfg.max_hold_seconds and not riding:
         return flatten("time", f"Max hold reached ({int(held_for)}s)")
 
     if done and cfg.trail_cents > 0 and (peak - gain) >= cfg.trail_cents:
@@ -443,6 +484,10 @@ def view(mode):
                 "bid_cents": bid,
                 "open_gain_cents": gain,
                 "peak_gain_cents": round(lot.get("peak_gain", 0), 1),
+                "stop_cents": lot.get("stop_cents") or cfg.stop_cents,
+                "riding_to_settlement": _riding_to_settlement(
+                    cfg, bid, None if bid is None else bid - lot["entry_price"]
+                ),
                 "tiers_hit": lot.get("tiers_done") or [],
                 "held_seconds": int(time.time() - (lot.get("opened_at") or time.time())),
                 "seconds_to_close": (
