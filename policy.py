@@ -18,6 +18,12 @@ Four gates matter more here than in a hold-to-settlement design:
      peaks near the 50c midpoint. An edge that looks real before fees can be
      a guaranteed loss after both the entry and exit fill are charged.
 
+On top of the pricing gates sits the chart read (indicators.py): an entry must
+agree with the EMA trend, must not chase an RSI-exhausted move, and carries a
+volatility-scaled stop instead of a fixed one. The live loss pattern this
+kills: enter on a burst against the larger trend, get clipped by noise seconds
+later because the fixed 6c stop sat inside the tape's normal wiggle.
+
 Every rejection returns a specific reason. "Expected move 1.8c short of the 3c
 small target" is debuggable; a bare NO TRADE is not.
 """
@@ -27,6 +33,7 @@ import time
 from datetime import datetime
 
 import config
+import indicators
 
 
 def _no_trade(reason, **extra):
@@ -373,6 +380,20 @@ def evaluate(trades, market, orderbook):
     tiers = cfg.tiers()
     confidence = int(round(prob * 100))
 
+    chart = indicators.analyze(trades)
+
+    # The stop this entry will carry: STOP_VOL_MULT times the expected
+    # one-minute contract move, clamped. A 6c stop in a tape that routinely
+    # wiggles 8c a minute is a coin-flip donation; the same 6c in a dead tape
+    # is more room than the trade deserves.
+    stop_cents = cfg.stop_cents
+    move_1min = expected_move_cents(z, 60.0, remaining)
+    if move_1min is not None:
+        stop_cents = max(
+            cfg.stop_min_cents,
+            min(cfg.stop_max_cents, int(round(cfg.stop_vol_mult * move_1min))),
+        )
+
     count_estimate = max(1, cfg.max_contracts_per_trade)
     est_exit_price = exit_bid if exit_bid is not None else ask
     entry_is_maker = cfg.entry_style == "maker"
@@ -407,10 +428,14 @@ def evaluate(trades, market, orderbook):
         "fee_cents_per_contract": round(fee_cents_per_contract, 2),
         "efficiency_ratio": None if efficiency is None else round(efficiency, 3),
         "maker_entry_price_cents": maker_entry_price,
+        "trend": None if chart is None else chart["trend"],
+        "ema_separation_bps": None if chart is None else chart["separation_bps"],
+        "rsi": None if chart is None else chart["rsi"],
         "scalp_targets": {
             tier.name: min(99, ask + tier.cents) for tier in tiers
         },
-        "stop_price_cents": max(1, ask - cfg.stop_cents),
+        "stop_cents": stop_cents,
+        "stop_price_cents": max(1, ask - stop_cents),
     }
 
     if not cfg.min_price_cents <= ask <= cfg.max_price_cents:
@@ -442,6 +467,37 @@ def evaluate(trades, market, orderbook):
             **diagnostics,
         )
 
+    # ---- the chart read ------------------------------------------------
+    # A BUY YES is a bet the tape keeps going up; a BUY NO that it keeps
+    # going down. Neither is taken against, or without, an established trend.
+    if chart is None:
+        return _no_trade(
+            "Chart warmup: not enough tape yet for the EMA/RSI read", **diagnostics
+        )
+
+    wanted_trend = "up" if side == "yes" else "down"
+    if chart["trend"] != wanted_trend:
+        return _no_trade(
+            f"Trend gate: chart reads '{chart['trend']}' "
+            f"(EMA gap {chart['separation_bps']:+.1f}bps), "
+            f"BUY {side.upper()} needs '{wanted_trend}'",
+            **diagnostics,
+        )
+
+    if side == "yes" and chart["rsi"] >= cfg.rsi_overbought:
+        return _no_trade(
+            f"RSI gate: {chart['rsi']:.0f} is overbought (>= {cfg.rsi_overbought:.0f}) -- "
+            f"buying YES here is chasing an exhausted move",
+            **diagnostics,
+        )
+
+    if side == "no" and chart["rsi"] <= cfg.rsi_oversold:
+        return _no_trade(
+            f"RSI gate: {chart['rsi']:.0f} is oversold (<= {cfg.rsi_oversold:.0f}) -- "
+            f"buying NO here is chasing an exhausted move",
+            **diagnostics,
+        )
+
     if confidence < cfg.min_confidence:
         return _no_trade(
             f"Confidence {confidence}% below the {cfg.min_confidence}% floor", **diagnostics
@@ -460,7 +516,8 @@ def evaluate(trades, market, orderbook):
         "reason": (
             f"Fair {prob * 100:.1f}% vs {ask}c ask - {edge:.1f}c edge "
             f"({fee_cents_per_contract:.1f}c fees included), "
-            f"~{move:.1f}c expected travel, scalping to "
+            f"trend {chart['trend']} (RSI {chart['rsi']:.0f}), "
+            f"~{move:.1f}c expected travel, {stop_cents}c stop, scalping to "
             f"{'/'.join(str(tier.cents) for tier in tiers)}c"
         ),
     }
