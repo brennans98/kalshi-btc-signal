@@ -341,7 +341,11 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     # with; a wider stop means fewer contracts for the same risk budget.
     stop_cents = int(signal.get("stop_cents") or cfg.stop_cents)
     if balance_cents is not None and stop_cents > 0:
-        risk_budget = int(balance_cents) * cfg.per_trade_risk_pct // 100
+        # The strategy split: favorites risk their full premium (stop == ask)
+        # against their own budget slice; scalps risk their stop distance
+        # against theirs. Each strategy is sized independently.
+        risk_pct = cfg.fav_risk_pct if signal.get("favorite") else cfg.per_trade_risk_pct
+        risk_budget = int(balance_cents) * risk_pct // 100
         count = min(count, max(0, risk_budget // stop_cents))
 
     # Never size beyond what the exit side can absorb. Entering 6 contracts
@@ -349,7 +353,8 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     # The exit-liquidity cap protects round trips; a late settlement snipe
     # never exits, so the resting bid's depth is irrelevant to it.
     exit_size = signal.get("exit_bid_size")
-    if not signal.get("late_settlement") and isinstance(exit_size, int) and exit_size > 0:
+    holds_to_settlement = signal.get("late_settlement") or signal.get("favorite")
+    if not holds_to_settlement and isinstance(exit_size, int) and exit_size > 0:
         count = min(count, exit_size)
 
     if count < 1:
