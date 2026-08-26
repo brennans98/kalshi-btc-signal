@@ -29,6 +29,7 @@ small target" is debuggable; a bare NO TRADE is not.
 """
 
 import math
+import os
 import time
 from datetime import datetime
 
@@ -40,6 +41,20 @@ def _no_trade(reason, **extra):
     payload = {"action": "NO TRADE", "confidence": 0, "reason": reason}
     payload.update(extra)
     return payload
+
+
+def _env_int(name, default):
+    try:
+        return int(float((os.getenv(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    try:
+        return float((os.getenv(name) or str(default)).strip())
+    except ValueError:
+        return default
 
 
 def _normal_cdf(x):
@@ -370,6 +385,7 @@ def evaluate(trades, market, orderbook):
         return _no_trade(f"Book spread too wide to scalp ({spread}c)")
 
     spot = trades[-1][1]
+    gap_bps = None if strike <= 0 else (spot - strike) / strike * 10000.0
     z = standard_score(spot, strike, sigma, remaining)
     fair_yes = None if z is None else _normal_cdf(z)
 
@@ -439,6 +455,7 @@ def evaluate(trades, market, orderbook):
         "strike": strike,
         "strike_source": strike_source,
         "spot": spot,
+        "gap_bps": None if gap_bps is None else round(gap_bps, 1),
         "sigma_per_second": round(sigma, 8),
         "seconds_to_close": int(remaining),
         "expected_move_cents": None if move is None else round(move, 2),
@@ -489,6 +506,58 @@ def evaluate(trades, market, orderbook):
         favorite["favorite"] = True
         favorite["stop_cents"] = ask
         favorite["stop_price_cents"] = None
+
+    # ---- the conviction hold ---------------------------------------------
+    # The third lane, and the one that pays for the whole strategy when it
+    # is right: early in the round, spot has already cleared the strike by a
+    # real margin (the gap, in bps of price), the chart trend agrees, the
+    # tape is actually travelling, and the model still prices the side
+    # comfortably above a mid-price ask. Locked once and held to fee-free
+    # settlement -- no ladder, no early exit, the full premium at risk.
+    # Rides the favorite's executor path (maker entry, settle-only), so a
+    # hold lock is sized by FAV_RISK_PCT like any other settle-held lot.
+    # Tunables (env): HOLD_ENTRY=0 disables; HOLD_MIN/MAX_PRICE_CENTS bound
+    # the ask; HOLD_MIN_FAIR_PROB, HOLD_MIN_EDGE_CENTS, HOLD_MIN_GAP_BPS set
+    # the conviction bar; HOLD_MIN_SECONDS_TO_CLOSE keeps locks early in the
+    # round, where the discount still exists.
+    if favorite is None and not late_window and chart is not None:
+        hold_on = _env_int("HOLD_ENTRY", 1)
+        hold_min_price = _env_int("HOLD_MIN_PRICE_CENTS", 45)
+        hold_max_price = _env_int("HOLD_MAX_PRICE_CENTS", 74)
+        hold_min_prob = _env_float("HOLD_MIN_FAIR_PROB", 0.68)
+        hold_min_edge = _env_float("HOLD_MIN_EDGE_CENTS", 4.0)
+        hold_min_gap = _env_float("HOLD_MIN_GAP_BPS", 5.0)
+        hold_min_remaining = _env_int("HOLD_MIN_SECONDS_TO_CLOSE", 600)
+        gap_clears = gap_bps is not None and (
+            gap_bps >= hold_min_gap if side == "yes" else gap_bps <= -hold_min_gap
+        )
+        if (
+            hold_on
+            and maker_entry_price is not None
+            and hold_min_price <= ask <= hold_max_price
+            and remaining >= hold_min_remaining
+            and prob >= hold_min_prob
+            and edge >= hold_min_edge
+            and gap_clears
+            and chart["trend"] == ("up" if side == "yes" else "down")
+            and (efficiency is None or efficiency >= cfg.min_efficiency_ratio)
+        ):
+            favorite = {
+                "action": f"BUY {side.upper()}",
+                "confidence": confidence,
+                "reason": (
+                    f"Conviction hold: gap {gap_bps:+.1f}bps clears the "
+                    f"{hold_min_gap:.1f}bps line with {remaining:.0f}s left, fair "
+                    f"{prob * 100:.1f}% vs {ask}c ask ({edge:.1f}c edge), trend "
+                    f"'{chart['trend']}' agreeing -- maker entry, held to "
+                    f"settlement for the fee-free 100c, full premium at risk"
+                ),
+            }
+            favorite.update(diagnostics)
+            favorite["favorite"] = True
+            favorite["hold_lock"] = True
+            favorite["stop_cents"] = ask
+            favorite["stop_price_cents"] = None
 
     # The price band and exit-liquidity gates protect round trips. A late
     # settlement snipe never exits -- it buys 90+c contracts on purpose --
