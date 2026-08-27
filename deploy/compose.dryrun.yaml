@@ -22,11 +22,17 @@
 
 services:
   btc-bot:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    # Or, if you build and push the image yourself:
-    # image: ghcr.io/brennans98/kalshi-btc-signal:latest
+    # Pulled from GHCR, published by .github/workflows/ci.yml on every push to
+    # main that passes the test suite. This is why updating the server is a
+    # Dockge "Update" click and not a shell session: the image you pull is the
+    # code that passed CI. To move the server forward, pull and restart the
+    # stack -- no git on the box, no file copying.
+    image: ghcr.io/brennans98/kalshi-btc-signal:latest
+    # To build on the server instead (e.g. testing an unmerged branch), comment
+    # out `image:` above and uncomment this, with the repo checked out alongside:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
     container_name: btc-bot-dryrun
     restart: unless-stopped
     ports:
