@@ -42,6 +42,7 @@ import config
 import policy
 import risk
 import scalp
+import store
 from kalshi_client import KalshiApiError, KalshiAuthError
 
 status = {
@@ -60,6 +61,54 @@ status = {
 _book_cache = {}
 _BOOK_TTL = 1.5
 
+# ---- the live book, and why this matters more than anything else here ----
+# app.py already maintains an authenticated WebSocket orderbook feed, applying
+# every orderbook_delta Kalshi pushes into an in-memory book. This module,
+# however, used to fetch the book over REST with a 1.5-second cache for every
+# exit decision -- so stops, trails and guards were evaluated against a price
+# that could be a second and a half stale, on a market that reprices several
+# times a second. On a co-located server that is a self-inflicted wound: the
+# network round trip was never the bottleneck, the cache was.
+#
+# book_provider is installed by app.py at startup and returns
+# (book, published_at) from that live feed. REST remains the fallback for when
+# the socket is reconnecting, which is the only time it should ever be hit.
+_book_provider = None
+_book_source = {"last": None, "ws_hits": 0, "rest_hits": 0}
+
+# Set by app.py on every book publish so the loop can wake on a price change
+# instead of sleeping through it. Assigned lazily because the event must be
+# created on the running loop.
+_book_event = None
+
+
+def set_book_provider(provider):
+    """Install the in-memory WebSocket book reader (called once, from app.py)."""
+    global _book_provider
+    _book_provider = provider
+
+
+def book_event():
+    """The asyncio.Event the loop waits on, created on first use."""
+    global _book_event
+    if _book_event is None:
+        _book_event = asyncio.Event()
+    return _book_event
+
+
+def notify_book():
+    """Wake the trading loop: the book just changed.
+
+    Called from app.py's WebSocket publish path. This is the mechanism that
+    turns a fixed 2-second poll into an event-driven reaction -- exits are
+    evaluated on the tick that moved the price, not up to two seconds later.
+    """
+    try:
+        book_event().set()
+    except RuntimeError:
+        # No running loop yet (import-time or shutdown); nothing to wake.
+        pass
+
 
 def mode():
     value = config.settings.trading_mode
@@ -70,7 +119,7 @@ def _order_id(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:16]}"
 
 
-def snapshot():
+def snapshot(client=None):
     """Everything the dashboard needs about the trader."""
     active = mode()
     state = risk.load_state()
@@ -86,17 +135,51 @@ def snapshot():
     payload["day_start_balance_cents"] = state.get("day_start_balance_cents")
     payload["drawdown_cents"] = risk.drawdown_cents(_equity_cents(), state=state)
     payload["scalp"] = scalp.view(active if active != "off" else "dryrun")
+    # Persistence health. If this is unhealthy, state is not reaching disk and a
+    # restart will forget open positions and any latched halt -- which matters
+    # more than anything else on this payload.
+    payload["storage"] = store.status()
+    # Clock health. Time-to-close drives the settlement guard, the late-entry
+    # window and every exit deadline, so a drifting clock is a trading fault --
+    # visible here rather than discovered through an unexited expiry.
+    if client is not None:
+        payload["clock"] = client.clock_status()
     return payload
 
 
 async def _book(client, ticker):
-    """Orderbook with a short TTL, so several lots on one ticker share a fetch."""
+    """The freshest book available for this ticker.
+
+    Order of preference:
+      1. The in-memory WebSocket book, if it is younger than
+         BOOK_MAX_AGE_SECONDS. Free, and as current as the exchange.
+      2. A REST fetch with a short TTL, for when the socket is down or
+         reconnecting.
+
+    Every exit decision reads through here, so the WS path is what makes
+    stops and trails act on the price that actually exists right now.
+    """
+    if _book_provider is not None:
+        try:
+            result = _book_provider(ticker)
+        except Exception:
+            result = None
+        if result:
+            book, published_at = result
+            age = time.time() - (published_at or 0)
+            if book and age <= config.settings.book_max_age_seconds:
+                _book_source["last"] = "ws"
+                _book_source["ws_hits"] += 1
+                return book
+
     cached = _book_cache.get(ticker)
     if cached and time.time() - cached[0] < _BOOK_TTL:
         return cached[1]
 
     book = await client.get_orderbook(ticker)
     _book_cache[ticker] = (time.time(), book)
+    _book_source["last"] = "rest"
+    _book_source["rest_hits"] += 1
     return book
 
 
@@ -164,15 +247,27 @@ def _record_pending_fills(pending_key, pending, filled_total):
         pending.get("close_epoch"),
         stop_cents=pending.get("stop_cents"),
         settle_only=bool(pending.get("settle_only")),
+        lane=pending.get("lane"),
+        conviction=pending.get("conviction"),
+        # A resting order is a maker fill by construction, and fills at exactly
+        # its limit price -- so the price is exact and the fee is the maker rate
+        # (zero for this series today).
+        entry_fee_cents=policy.maker_fee_cents(1, price),
     )
     pending["filled_recorded"] = filled_total
 
     if not pending.get("trade_counted"):
         # One resting order is one trade for pacing purposes (cooldown, daily
-        # cap), counted when its first contract lands. Later partial fills
-        # extend the same lot at the same price.
+        # cap), counted when its first contract lands.
         risk.record_trade(pending["ticker"], filled_total, filled_total * price)
         pending["trade_counted"] = True
+    else:
+        # Later partial fills on the same resting order are not new trades, but
+        # they ARE new money deployed. Previously only the contracts filled at
+        # the moment the order first traded were added to the day's cost, so a
+        # resting order that filled in pieces silently understated the day's
+        # deployment for the rest of the session.
+        risk.record_cost(new_fill * price)
 
     scalp.pending_put("live", pending_key, pending)
 
@@ -357,6 +452,12 @@ async def _cancel_pending_entry(client, pending_key, pending, reason):
 _unready_markets = {}
 
 
+# Last settlement lookup per ticker, so a stale lot is checked on a human
+# timescale rather than on every sub-second tick.
+_settle_checks = {}
+_SETTLE_CHECK_SECONDS = 5.0
+
+
 def _defer_market(ticker, seconds=20):
     now = time.time()
     for key in [k for k, until in _unready_markets.items() if until <= now]:
@@ -383,8 +484,18 @@ async def _settle_stale_lot(client, active, lot):
     A lot that rides to settlement (or that the guard could not flatten) never
     gets an exit fill, so without this it lingers as a ghost position forever,
     eating an open-position slot and hiding settlement wins from the stats.
+
+    Throttled: settlement is published once, and the loop now runs several
+    times a second. Without the throttle a single unsettled stale lot would
+    issue a market fetch on every tick, spending rate limit on a value that
+    changes at most once.
     """
     ticker = lot["ticker"]
+    now = time.time()
+    if now - float(_settle_checks.get(ticker) or 0) < _SETTLE_CHECK_SECONDS:
+        return
+    _settle_checks[ticker] = now
+
     try:
         market = await client.get_market(ticker)
     except KalshiAuthError:
@@ -399,8 +510,17 @@ async def _settle_stale_lot(client, active, lot):
 
     won = result == lot["side"]
     count = lot.get("count_open") or 0
+    # Settlement is fee-free on Kalshi: a contract held to expiry pays 100c or
+    # 0c with no exit fee. Passing 0 explicitly stops the fallback fee model
+    # from inventing an exit cost that was never charged.
     realized = scalp.record_exit(
-        active, lot["key"], "settlement", "settlement", count, 100 if won else 0
+        active,
+        lot["key"],
+        "settlement",
+        "settlement",
+        count,
+        100 if won else 0,
+        exit_fee_cents=0.0,
     )
     outcome = "settled_win" if won else "settled_loss"
     reason = (
@@ -516,6 +636,10 @@ async def _place_maker_entry(client, signal, market, record, sizing):
         "trade_counted": False,
         "stop_cents": signal.get("stop_cents"),
         "settle_only": bool(signal.get("favorite") or signal.get("late_settlement")),
+        # Carried onto the lot when the resting order fills, so the exit
+        # engine and the dashboard know which lane opened it.
+        "lane": signal.get("lane"),
+        "conviction": signal.get("conviction"),
         "fair_cents": None if fair_prob is None else round(fair_prob * 100.0, 1),
     }
     scalp.pending_put("live", scalp.key(ticker, side), pending)
@@ -655,8 +779,16 @@ async def _poll_exit_orders(client, lot):
         new_fill = filled - int(rung.get("filled_recorded") or 0)
 
         if new_fill > 0:
+            # A resting rung fills AT its limit price, so that price is the
+            # true fill. The fee is the maker rate for this series.
             realized = scalp.record_exit(
-                "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+                "live",
+                lot["key"],
+                tier_name,
+                "profit",
+                new_fill,
+                rung["price_cents"],
+                exit_fee_cents=policy.maker_fee_cents(1, rung["price_cents"]),
             )
             rung["filled_recorded"] = filled
             changed = True
@@ -725,7 +857,13 @@ async def _cancel_exit_orders(client, lot):
             new_fill = filled - int(rung.get("filled_recorded") or 0)
             if new_fill > 0:
                 realized = scalp.record_exit(
-                    "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+                    "live",
+                    lot["key"],
+                    tier_name,
+                    "profit",
+                    new_fill,
+                    rung["price_cents"],
+                    exit_fee_cents=policy.maker_fee_cents(1, rung["price_cents"]),
                 )
                 rung["filled_recorded"] = filled
                 risk.log_decision(
@@ -828,7 +966,18 @@ async def run_exits(client, signal=None):
         return
 
     trend = (signal or {}).get("trend")
-    maker_exits = active == "live" and config.settings.exit_style == "maker"
+    # A resting maker ladder and a trailing stop are incompatible ideas. The
+    # ladder commits to selling at fixed prices decided when the lot opened,
+    # which is exactly the behaviour that capped the winners: a lot that is
+    # about to run 30c has already sold half of itself at +3c. The runner
+    # profile takes the other side of that trade -- it holds, and exits on a
+    # trail that moves with the peak -- so it must exit as a taker and must
+    # not leave resting sells on the book.
+    maker_exits = (
+        active == "live"
+        and config.settings.exit_style == "maker"
+        and config.settings.exit_profile == "ladder"
+    )
     pending = scalp.pending_all("live") if active == "live" else {}
 
     for lot in scalp.open_lots(active):
@@ -898,6 +1047,13 @@ async def _execute_exit(client, active, lot, intent):
     ticker, side = lot["ticker"], lot["side"]
     count, price = intent["count"], intent["limit_price"]
 
+    # What we assume until the exchange tells us otherwise. In dryrun these
+    # assumptions ARE the record, so they are deliberately pessimistic: fill at
+    # the limit (never better) and pay the taker fee. A simulation that assumes
+    # the good version of both is how a bot looks profitable on paper.
+    exit_price = float(price)
+    exit_fee = policy.taker_fee_cents(1, price)
+
     record = {
         "event": "exit",
         "mode": active,
@@ -950,8 +1106,22 @@ async def _execute_exit(client, active, lot, intent):
         count = min(count, filled)
         record["filled"] = filled
 
+        # A sell IOC at limit P fills against bids at or above P, so the
+        # average fill is at least as good as the limit. Recording the limit
+        # understated every profitable exit. Use the exchange's VWAP and its
+        # real fee.
+        actual_exit = client.average_fill_price_cents(response)
+        actual_exit_fee = client.average_fee_paid_cents(response)
+        if actual_exit is not None:
+            record["actual_exit_price_cents"] = round(actual_exit, 3)
+            exit_price = actual_exit
+        if actual_exit_fee is not None:
+            record["actual_exit_fee_cents"] = round(actual_exit_fee, 3)
+            exit_fee = actual_exit_fee
+
     realized = scalp.record_exit(
-        active, lot["key"], intent["tier"], intent["kind"], count, price
+        active, lot["key"], intent["tier"], intent["kind"], count, exit_price,
+        exit_fee_cents=exit_fee,
     )
 
     if intent["kind"] == "stop":
@@ -1022,8 +1192,26 @@ async def run_entry(client, signal, market):
 
     ticker = signal["ticker"]
     side = signal["side"]
-    price = int(signal["price_cents"])
     count = sizing["count"]
+
+    # The price the edge was measured at (best offer) and the price the order
+    # must carry to actually complete. They differ whenever the size we want is
+    # deeper than the best level. Sending the best offer as the limit on a
+    # fill-or-kill order for more contracts than rest there guarantees a kill:
+    # the exchange cannot fill the whole size at that price, so it fills none.
+    quoted_price = int(signal["price_cents"])
+    price = int(sizing.get("limit_price_cents") or quoted_price)
+    # The modeled average, used as the basis only until the exchange tells us
+    # the real one.
+    expected_basis = float(sizing.get("avg_price_cents") or price)
+    # Overwritten with the exchange's real VWAP once the order comes back. In
+    # dryrun the modeled sweep average IS the basis -- which is the point of
+    # modeling it, so a dry run's P&L reflects slippage instead of pretending
+    # every order fills at the top of book.
+    basis_cents = expected_basis
+    # Pessimistic until the exchange reports the real figure, for the same
+    # reason as the exit: a dry run must not assume the cheap version.
+    entry_fee_cents = policy.taker_fee_cents(1, expected_basis)
 
     # A late settlement snipe always enters as a taker: a resting post-only
     # bid has no time to fill this close to settlement, and an unfilled
@@ -1069,34 +1257,78 @@ async def run_entry(client, signal, market):
         # V2 returns 201 even when a fill-or-kill order is killed unfilled.
         # An unfilled entry is not a trade: no lot, no cooldown, no daily count.
         filled = client.filled_count(response)
-        if filled < count:
+
+        if filled <= 0:
             record["outcome"] = "unfilled"
-            record["filled"] = filled
+            record["filled"] = 0
             status["last_decision"] = {
                 "outcome": "unfilled",
                 "reason": (
-                    f"FOK entry killed unfilled ({filled}/{count} "
+                    f"FOK entry killed unfilled (0/{count} "
                     f"{side} @ {price}c on {ticker})"
                 ),
             }
             risk.log_decision(record)
             return
 
+        if filled < count:
+            # Fill-or-kill should make this impossible, so reaching it means an
+            # assumption about the exchange is wrong. The old code returned here
+            # without recording anything -- which would leave a REAL position
+            # open on Kalshi that the bot does not know it owns: no stop, no
+            # trail, no exit, discovered only at the next reconcile. Record what
+            # actually filled and manage it.
+            record["partial_fill"] = {"requested": count, "filled": filled}
+            status["last_error"] = (
+                f"Entry partially filled ({filled}/{count}) despite fill-or-kill; "
+                f"managing the {filled} contracts that filled"
+            )
+            count = filled
+
+        # The exchange's own volume-weighted fill price, which is the only
+        # correct basis for the stop, the trail and P&L. Fall back to the
+        # modeled sweep average only if the field is absent.
+        actual_basis = client.average_fill_price_cents(response)
+        actual_fee = client.average_fee_paid_cents(response)
+        if actual_basis is not None:
+            basis_cents = actual_basis
+        if actual_fee is not None:
+            entry_fee_cents = actual_fee
+        record["fill"] = {
+            "filled": filled,
+            "quoted_price_cents": quoted_price,
+            "limit_price_cents": price,
+            "expected_basis_cents": round(expected_basis, 3),
+            "actual_basis_cents": None if actual_basis is None else round(actual_basis, 3),
+            "actual_fee_cents_per_contract": None if actual_fee is None else round(actual_fee, 3),
+            "slippage_vs_quote_cents": round(basis_cents - quoted_price, 3),
+        }
+
     # Recorded in both live and dryrun. Cooldown and the daily trade cap are
     # pacing limits, not capital controls -- they need to be exercised in
     # dryrun too, or a dry run can fire trades back-to-back at a rate live
     # trading never could, making the simulation misleading.
-    risk.record_trade(ticker, count, sizing["cost_cents"])
+    # Cost recorded from the basis actually paid, not the quoted price. The
+    # daily loss limit and pacing counters are only as accurate as this number.
+    actual_cost_cents = int(round(count * basis_cents))
+    risk.record_trade(ticker, count, actual_cost_cents)
 
+    # The lot's entry price is the basis actually paid, rounded to the cent.
+    # Every exit decision -- stop distance, trail arming, the runner's peak --
+    # measures from this number, so recording the quoted price instead of the
+    # filled price biased every one of them in the same direction.
     scalp.record_entry(
         active,
         ticker,
         side,
         count,
-        price,
+        int(round(basis_cents)),
         policy.close_epoch(market),
         stop_cents=signal.get("stop_cents"),
         settle_only=bool(signal.get("late_settlement") or signal.get("favorite")),
+        lane=signal.get("lane"),
+        conviction=signal.get("conviction"),
+        entry_fee_cents=entry_fee_cents,
     )
 
     targets = signal.get("scalp_targets") or {}
@@ -1108,7 +1340,10 @@ async def run_entry(client, signal, market):
         "ticker": ticker,
         "side": side,
         "count": count,
-        "price_cents": price,
+        "price_cents": int(round(basis_cents)),
+        "quoted_price_cents": quoted_price,
+        "limit_price_cents": price,
+        "slippage_cents": round(basis_cents - quoted_price, 2),
         "targets": targets,
         "stop_cents": signal.get("stop_price_cents"),
         "simulated": active != "live",
@@ -1118,7 +1353,12 @@ async def run_entry(client, signal, market):
         "outcome": record["outcome"],
         "reason": (
             f"{'Bought' if active == 'live' else 'Simulated'} {count} {side} "
-            f"@ {price}c on {ticker}"
+            f"@ {basis_cents:.2f}c on {ticker}"
+            + (
+                f" (quoted {quoted_price}c, limit {price}c)"
+                if abs(basis_cents - quoted_price) >= 0.005
+                else ""
+            )
         ),
     }
 
@@ -1155,14 +1395,29 @@ def _equity_cents():
     return total
 
 
+_last_pending_poll = 0.0
+
+
 async def tick(client, signal_provider, market_provider):
+    global _last_pending_poll
+
     status["last_tick_at"] = int(time.time())
+    status["book_source"] = _book_source["last"]
     signal = signal_provider()
 
     # Resting entries first: their fills create the lots the exit pass must
     # then protect (and the adverse-selection guard needs the fresh signal).
     # Then exits, always before entries. See module docstring.
-    await _poll_pending_entries(client, signal)
+    #
+    # Order-status polling is throttled independently of the loop. The loop now
+    # runs several times a second, but polling an order's status is a REST call
+    # against a rate limit, and nothing about a resting order changes usefully
+    # faster than PENDING_POLL_SECONDS. Exits, by contrast, are free -- they
+    # read the in-memory book -- so they run every single tick.
+    if time.time() - _last_pending_poll >= config.settings.pending_poll_seconds:
+        _last_pending_poll = time.time()
+        await _poll_pending_entries(client, signal)
+
     await run_exits(client, signal)
 
     # Evaluate the daily loss limit every tick, independent of whether a BUY
@@ -1179,6 +1434,11 @@ async def tick(client, signal_provider, market_provider):
         return
 
     await run_entry(client, signal, market_provider())
+
+    # Commit anything the tick deferred. Last, so it is never in front of an
+    # exit decision, and unconditional, so a quiet market cannot leave the most
+    # recent mark unwritten indefinitely.
+    store.flush(max_delay=1.0)
 
 
 async def loop(client, signal_provider, market_provider):
@@ -1228,4 +1488,23 @@ async def loop(client, signal_provider, market_provider):
         except Exception as error:
             status["last_error"] = str(error)[:200]
 
-        await asyncio.sleep(config.settings.loop_seconds)
+        # Wait for the book to change, and fall back to the loop interval when
+        # it is quiet. This is the difference between reacting to a dip on the
+        # delta that created it and finding out about it up to two seconds
+        # later -- the entire point of being co-located.
+        #
+        # The floor first: on a fast tape the wake event is set again before the
+        # tick finishes, so without it the loop never yields at all.
+        floor = config.settings.loop_min_seconds
+        if floor > 0:
+            await asyncio.sleep(floor)
+
+        event = book_event()
+        try:
+            timeout = max(0.0, config.settings.loop_seconds - floor)
+            if timeout > 0:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            event.clear()

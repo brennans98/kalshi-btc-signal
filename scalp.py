@@ -42,6 +42,7 @@ import math
 import time
 
 import config
+import store
 
 
 def _blank_tier_hits():
@@ -60,7 +61,16 @@ def _blank():
             "time_exits": 0,
             "chart_exits": 0,
             "settlement_exits": 0,
+            # Net of fees -- the number that says whether this works.
             "realized_cents": 0,
+            # Exact fractional accumulators; the integers above are rounded
+            # views of these, so partial exits do not accumulate rounding drift.
+            "realized_cents_exact": 0.0,
+            "gross_cents_exact": 0.0,
+            "fees_cents_exact": 0.0,
+            # Gross and fees kept separately so the cost of trading is visible.
+            "realized_gross_cents": 0,
+            "fees_cents": 0,
             "wins": 0,
             "losses": 0,
         },
@@ -71,11 +81,41 @@ def _path(mode):
     return config.settings.lots_path(mode)
 
 
+def _round_half_up(value):
+    """Round to a whole cent, half away from zero.
+
+    Python's built-in round() is banker's rounding: round(12.5) is 12, not 13.
+    For money that is both surprising and biased in a way that shows up in
+    aggregates, so money rounding is explicit here.
+    """
+    return int(math.floor(value + 0.5)) if value >= 0 else -int(math.floor(-value + 0.5))
+
+
+def _modeled_fee_per_contract(price_cents):
+    """Published Kalshi taker fee for one contract at this price, in cents.
+
+    0.07 * P * (1 - P) with P in dollars. Used only when the exchange has not
+    told us the real number -- dryrun, adopted positions, or a response missing
+    the field. Deliberately the TAKER rate: assuming the cheaper maker rate
+    would understate costs, and this number exists to stop costs being
+    understated.
+    """
+    if price_cents is None:
+        return 0.0
+    p = max(0.0, min(1.0, float(price_cents) / 100.0))
+    return 0.07 * p * (1 - p) * 100.0
+
+
 def load(mode):
-    try:
-        state = json.loads(_path(mode).read_text())
-    except Exception:
-        return _blank()
+    """Current lot state. Served from memory; see store.py for why.
+
+    Note this returns the LIVE cached object, not a copy: callers mutate it and
+    then call save(). That is deliberate -- copying the whole lot book on every
+    read of a sub-second loop is exactly the kind of overhead this change was
+    made to remove -- but it means a caller must not mutate state it does not
+    intend to persist.
+    """
+    state = store.read(_path(mode), _blank)
 
     blank = _blank()
     state.setdefault("lots", {})
@@ -89,13 +129,22 @@ def load(mode):
     return state
 
 
+def save_lazy(mode, state):
+    """Update lot state in memory and let store coalesce the disk write.
+
+    Only for per-tick bookkeeping. Entries, exits and settlements use save().
+    """
+    store.write_lazy(_path(mode), state, max_delay=1.0)
+
+
 def save(mode, state):
-    try:
-        path = _path(mode)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    """Persist lot state atomically.
+
+    A failure here is NOT swallowed. Losing the lot book means losing the entry
+    basis of live positions, so the trader needs to know rather than find out
+    at the next restart.
+    """
+    store.write(_path(mode), state)
 
 
 def key(ticker, side):
@@ -194,9 +243,29 @@ def ladder_allocation(count):
 
 
 def record_entry(
-    mode, ticker, side, count, entry_price, close_epoch=None, stop_cents=None, settle_only=False
+    mode,
+    ticker,
+    side,
+    count,
+    entry_price,
+    close_epoch=None,
+    stop_cents=None,
+    settle_only=False,
+    lane=None,
+    conviction=None,
+    entry_fee_cents=None,
 ):
     """Open (or add to) a lot. Averages the basis if a lot already exists.
+
+    lane and conviction are the signal's provenance: which entry path fired
+    and how strong it read (0-100). Stored per lot so the trade record can be
+    grouped by lane afterwards.
+
+    entry_fee_cents is the fee PER CONTRACT actually charged on this entry
+    (Kalshi reports it as average_fee_paid), stored so realized P&L can be
+    reported net. Reporting gross P&L on a market where a round trip costs
+    roughly 3-4c per contract in fees makes a losing strategy look breakeven,
+    which is the single most misleading number a trading bot can produce.
 
     stop_cents is the volatility-scaled stop the signal computed at entry
     time; it is stored on the lot so plan() honors the stop the trade was
@@ -230,8 +299,19 @@ def record_entry(
             existing["stop_cents"] = int(stop_cents)
         if settle_only:
             existing["settle_only"] = True
+        if lane:
+            existing["lane"] = lane
+        if conviction is not None:
+            existing["conviction"] = int(conviction)
         existing["tiers_done"] = []
         existing["peak_gain"] = 0
+        # Fees follow the same weighted average as the basis, so a lot built
+        # from two fills at different fee rates carries the blended cost.
+        if entry_fee_cents is not None:
+            prior_fee = float(existing.get("entry_fee_cents") or 0.0)
+            existing["entry_fee_cents"] = round(
+                (held * prior_fee + count * float(entry_fee_cents)) / (held + count), 4
+            )
         state["lots"][lot_key] = existing
     else:
         state["lots"][lot_key] = {
@@ -244,9 +324,17 @@ def record_entry(
             "close_epoch": close_epoch,
             "stop_cents": int(stop_cents) if stop_cents else None,
             "settle_only": bool(settle_only),
+            # Which entry lane opened this lot, and how convinced it was. Kept
+            # on the lot so post-hoc analysis can compare lanes honestly --
+            # "the dip lane is working" needs to be checkable, not assumed.
+            "lane": lane,
+            "conviction": None if conviction is None else int(conviction),
             "tiers_done": [],
             "peak_gain": 0,
             "last_bid": entry_price,
+            # Fee per contract paid to open. None means unknown (an adopted
+            # position, or an exchange response without the field).
+            "entry_fee_cents": None if entry_fee_cents is None else round(float(entry_fee_cents), 4),
         }
 
     save(mode, state)
@@ -254,7 +342,19 @@ def record_entry(
 
 
 def mark(mode, lot_key, bid):
-    """Record the current bid and high-water gain. Called before plan()."""
+    """Record the current bid and high-water gain. Called before plan().
+
+    This runs on every tick of every open lot, which on an event-driven loop is
+    many times a second. It therefore persists LAZILY: the in-memory state is
+    updated immediately (so the trail and stop always read the true peak), but
+    the disk write is coalesced. Synchronously fsyncing the lot book several
+    times a second from inside the exit path would put filesystem latency in
+    front of every stop evaluation -- the exact opposite of the point.
+
+    The fields written here are also the cheapest ones to lose: after a crash,
+    reconcile() re-adopts the real position from the exchange, and the peak
+    rebuilds from the live book within a tick.
+    """
     state = load(mode)
     lot = (state.get("lots") or {}).get(lot_key)
     if not lot:
@@ -264,7 +364,7 @@ def mark(mode, lot_key, bid):
     lot["last_bid"] = bid
     lot["peak_gain"] = max(lot.get("peak_gain", 0), gain)
     lot["marked_at"] = time.time()
-    save(mode, state)
+    save_lazy(mode, state)
 
     lot = dict(lot)
     lot["key"] = lot_key
@@ -285,6 +385,123 @@ def _riding_to_settlement(cfg, bid, gain):
         and gain > 0
         and bid >= cfg.settle_ride_min_bid_cents
     )
+
+
+def runner_trail_cents(cfg, peak, opposed=False):
+    """How far below the peak the trailing stop sits, in cents.
+
+    None until the lot is RUNNER_ARM_CENTS in profit -- before that the hard
+    stop is the only protection, because a trail on an underwater lot is just
+    a tighter stop wearing a costume.
+
+    Once armed the trail is RUNNER_TRAIL_FRAC of the peak gain, clamped to
+    [MIN, MAX]. The shape matters: at a 6c peak the trail is the 5c floor, so
+    the lot has room to breathe; at a 30c peak it is the 12c cap, which is
+    only 40% of the move rather than the 100% a fixed 3c rung would have
+    surrendered by exiting at +3c. That is the whole difference between
+    scalping cents and riding a move.
+
+    A trend flip against a winning lot tightens the trail by RUNNER_FLIP_TIGHTEN
+    instead of dumping the position -- protecting the gain without paying a
+    spread every time the EMAs cross.
+    """
+    if peak < cfg.runner_arm_cents:
+        return None
+    trail = cfg.runner_trail_frac * peak
+    trail = max(float(cfg.runner_trail_min_cents), min(float(cfg.runner_trail_max_cents), trail))
+    if opposed:
+        trail = max(1.0, trail * cfg.runner_flip_tighten)
+    return trail
+
+
+def _plan_runner(cfg, lot, bid, now, gain, peak, stop_cents, remaining, limit_price, flatten, trend):
+    """The runner exit engine: hold winners, protect them with a trail.
+
+    The hard stop has already been checked by the caller and is identical in
+    both profiles. What differs is everything about a WINNING lot:
+
+      * no fixed profit rungs, so a winner is never capped at +3c
+      * a trend flip tightens the trail instead of closing the position
+      * max-hold does not evict a lot that is in profit and still onside
+      * deep ITM still rides to fee-free settlement
+
+    The cost of this is real and worth stating: every winner gives back part
+    of its peak, and trades that would have banked +3c under the ladder will
+    sometimes come back and stop out instead. It pays for that with the
+    winners the ladder used to cut off at the knees.
+    """
+    opposed = trend in ("up", "down") and (
+        (lot["side"] == "yes" and trend == "down") or (lot["side"] == "no" and trend == "up")
+    )
+    riding = _riding_to_settlement(cfg, bid, gain)
+
+    # A losing lot with the chart now against it: the reason for holding is
+    # gone, so cut rather than donate the rest of the stop distance.
+    if cfg.chart_exit and opposed and gain <= cfg.chart_exit_max_gain_cents:
+        return flatten(
+            "chart",
+            f"Chart flip: trend turned '{trend}' against this {lot['side'].upper()} "
+            f"lot at {gain:+.0f}c -- cutting now instead of riding to the "
+            f"{stop_cents}c stop",
+        )
+
+    # The trailing stop. Checked before the time-based exits so a winner that
+    # has rolled over exits on price, with a reason that says why.
+    trail = runner_trail_cents(cfg, peak, opposed)
+    if trail is not None and (peak - gain) >= trail:
+        return flatten(
+            "trail",
+            f"Trailing exit: gave back {peak - gain:.1f}c from a {peak:.1f}c peak "
+            f"(trail {trail:.1f}c"
+            + (", tightened on trend flip" if opposed else "")
+            + f", banking {gain:+.1f}c)",
+        )
+
+    if lot.get("close_epoch"):
+        seconds_left = lot["close_epoch"] - now
+        if seconds_left <= cfg.settlement_guard_seconds:
+            if riding:
+                return []
+            return flatten(
+                "time",
+                f"Settlement guard: {int(seconds_left)}s to close, flattening "
+                f"rather than holding a binary",
+            )
+
+    held_for = now - (lot.get("opened_at") or now)
+    if held_for >= cfg.max_hold_seconds and not riding:
+        # Max-hold exists to evict lots that are going nowhere. A lot in
+        # profit with the trend still onside is not going nowhere, and
+        # evicting it is exactly the behaviour that capped winners.
+        working = cfg.runner_hold_winners and gain > 0 and not opposed
+        if not working:
+            return flatten(
+                "time",
+                f"Max hold reached ({int(held_for)}s) at {gain:+.0f}c",
+            )
+
+    # Optional single de-risk slice. Off by default: it is the cent-scalping
+    # this profile exists to avoid, and is here only for whoever wants it.
+    if cfg.runner_partial_pct > 0 and "runner_partial" not in (lot.get("tiers_done") or []):
+        original = lot.get("count_original") or remaining
+        if gain >= cfg.runner_partial_cents and original >= 2:
+            count = min(remaining, max(1, math.floor(original * cfg.runner_partial_pct / 100)))
+            if count > 0:
+                return [
+                    {
+                        "tier": "runner_partial",
+                        "kind": "profit",
+                        "count": count,
+                        "limit_price": limit_price,
+                        "reason": (
+                            f"De-risk slice: +{gain:.0f}c reached the "
+                            f"{cfg.runner_partial_cents}c partial, selling "
+                            f"{cfg.runner_partial_pct}% and letting the rest run"
+                        ),
+                    }
+                ]
+
+    return []
 
 
 def plan(lot, bid, now=None, include_profit=True, trend=None):
@@ -333,8 +550,15 @@ def plan(lot, bid, now=None, include_profit=True, trend=None):
         ]
 
     # --- exits that override the ladder, in priority order ---------------
+    # The hard stop is profile-independent: it is the one exit that is never
+    # negotiable, and it is checked before anything else in both engines.
     if gain <= -stop_cents:
         return flatten("stop", f"Stop hit: {gain:.0f}c against a {stop_cents}c stop")
+
+    if cfg.exit_profile == "runner":
+        return _plan_runner(
+            cfg, lot, bid, now, gain, peak, stop_cents, remaining, limit_price, flatten, trend
+        )
 
     if cfg.chart_exit and trend in ("up", "down"):
         opposed = (lot["side"] == "yes" and trend == "down") or (
@@ -436,8 +660,19 @@ def plan(lot, bid, now=None, include_profit=True, trend=None):
     return intents
 
 
-def record_exit(mode, lot_key, tier, kind, count, exit_price):
-    """Reduce the lot and update statistics. Returns realized cents."""
+def record_exit(mode, lot_key, tier, kind, count, exit_price, exit_fee_cents=None):
+    """Reduce the lot and update statistics. Returns realized cents, NET OF FEES.
+
+    Previously this returned the gross price difference. On this market a taker
+    round trip costs roughly 3-4c per contract, and a scalp aims at a handful of
+    cents, so gross P&L does not merely flatter the record -- it can invert its
+    sign. A strategy averaging +2c gross per contract is losing money, and the
+    old number reported it as winning.
+
+    exit_fee_cents is the fee per contract on this exit leg. When the exchange
+    reports it we use that; otherwise we fall back to the published taker
+    formula, which is the conservative assumption (maker fills are cheaper).
+    """
     state = load(mode)
     lot = (state.get("lots") or {}).get(lot_key)
     if not lot:
@@ -447,14 +682,41 @@ def record_exit(mode, lot_key, tier, kind, count, exit_price):
     if count <= 0:
         return 0
 
-    realized = int(round((exit_price - lot["entry_price"]) * count))
+    gross = (exit_price - lot["entry_price"]) * count
+
+    # Entry fee is apportioned across the contracts being closed, so a lot
+    # exited in pieces pays its entry fee once in total rather than once per
+    # partial exit.
+    entry_fee_per_contract = lot.get("entry_fee_cents")
+    if entry_fee_per_contract is None:
+        entry_fee_per_contract = _modeled_fee_per_contract(lot["entry_price"])
+    if exit_fee_cents is None:
+        exit_fee_cents = _modeled_fee_per_contract(exit_price)
+
+    fees = (float(entry_fee_per_contract) + float(exit_fee_cents)) * count
+    realized_exact = gross - fees
+    realized = _round_half_up(realized_exact)
     lot["count_open"] = lot["count_open"] - count
 
     if kind == "profit" and tier not in (lot.get("tiers_done") or []):
         lot.setdefault("tiers_done", []).append(tier)
 
+    # Totals accumulate in EXACT fractional cents and are only rounded for
+    # display. Rounding each partial exit before adding it loses up to half a
+    # cent every time, and a lot that scales out in five pieces drifts from its
+    # own true P&L -- a bot that cannot add up its own results correctly cannot
+    # be evaluated at all.
     stats = state["stats"]
-    stats["realized_cents"] = stats.get("realized_cents", 0) + realized
+    stats["realized_cents_exact"] = float(stats.get("realized_cents_exact", 0.0)) + realized_exact
+    stats["gross_cents_exact"] = float(stats.get("gross_cents_exact", 0.0)) + gross
+    stats["fees_cents_exact"] = float(stats.get("fees_cents_exact", 0.0)) + fees
+
+    stats["realized_cents"] = _round_half_up(stats["realized_cents_exact"])
+    # Kept alongside the net figure so the cost of trading is visible rather
+    # than merely subtracted. If gross is healthy and net is not, the strategy
+    # is trading too often for the edge it has.
+    stats["realized_gross_cents"] = _round_half_up(stats["gross_cents_exact"])
+    stats["fees_cents"] = _round_half_up(stats["fees_cents_exact"])
 
     if kind == "profit":
         stats["tier_hits"][tier] = stats["tier_hits"].get(tier, 0) + 1
@@ -529,6 +791,15 @@ def view(mode):
                     cfg, bid, None if bid is None else bid - lot["entry_price"]
                 ),
                 "tiers_hit": lot.get("tiers_done") or [],
+                "lane": lot.get("lane"),
+                "conviction": lot.get("conviction"),
+                # Where the trailing stop currently sits, so the dashboard
+                # shows the live exit level rather than a static rung.
+                "trail_cents": (
+                    None
+                    if cfg.exit_profile != "runner" or lot.get("settle_only")
+                    else runner_trail_cents(cfg, max(lot.get("peak_gain", 0), gain or 0))
+                ),
                 "held_seconds": int(time.time() - (lot.get("opened_at") or time.time())),
                 "seconds_to_close": (
                     int(lot["close_epoch"] - time.time()) if lot.get("close_epoch") else None

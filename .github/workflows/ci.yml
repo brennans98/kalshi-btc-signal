@@ -1,0 +1,102 @@
+name: CI
+
+# Two jobs, in order:
+#
+#   test     runs on every push and PR. This is the gate.
+#   publish  builds the container and pushes it to GHCR, but ONLY on main and
+#            ONLY if the tests passed.
+#
+# The point of the publish job is that updating the server stops requiring a
+# shell on it. Dockge pulls the new image and restarts the stack; the code that
+# lands there is code that passed the suite. A bot that handles money should
+# never be updated by copying files onto a box by hand.
+
+on:
+  push:
+    branches: ["main", "rework/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Check configuration validity
+        # problems() must be empty for the shipped defaults. A default set that
+        # fails its own validation is a broken release regardless of the tests.
+        run: |
+          python - <<'PY'
+          import config
+          problems = config.settings.problems()
+          cautions = config.settings.cautions()
+          print("problems:", problems)
+          print("cautions:", cautions)
+          if problems:
+              raise SystemExit("Default configuration is invalid: %s" % problems)
+          PY
+
+      - name: Import and render the dashboard payload
+        # Catches the class of error the unit tests cannot: an import cycle, a
+        # missing key in the payload, a template that no longer renders.
+        run: |
+          python - <<'PY'
+          import app
+          payload = app.api_payload()
+          trader = payload["trader"]
+          for key in ("scalp", "storage", "clock", "limits"):
+              assert key in trader, "payload lost %r" % key
+          stats = trader["scalp"]["stats"]
+          for key in ("realized_cents", "realized_gross_cents", "fees_cents"):
+              assert key in stats, "stats lost %r" % key
+          print("payload ok")
+          PY
+
+  publish:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

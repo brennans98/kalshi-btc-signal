@@ -165,6 +165,12 @@ until you resume it.
 
 ---
 
+## The strategy rework
+
+`REWORK.md` documents the dip lanes, the runner exit profile, the consolidated
+spot feed, conviction sizing, and the latency changes -- including a size-cap
+change that raises per-position risk. Read it before enabling live trading.
+
 ## Every variable
 
 ### Entry

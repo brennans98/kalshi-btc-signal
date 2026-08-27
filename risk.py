@@ -28,6 +28,8 @@ import time
 from datetime import datetime, timezone
 
 import config
+import policy
+import store
 
 
 def limits():
@@ -43,6 +45,12 @@ def limits():
         "per_trade_risk_pct": cfg.per_trade_risk_pct,
         "cooldown_seconds": cfg.cooldown_seconds,
         "stop_cooldown_seconds": cfg.stop_cooldown_seconds,
+        "conviction_sizing": bool(cfg.conviction_sizing),
+        "min_cost_per_trade_cents": cfg.min_cost_per_trade_cents,
+        "max_entries_per_market": cfg.max_entries_per_market,
+        "dip_max_entries_per_market": cfg.dip_max_entries_per_market,
+        "dip_cooldown_seconds": cfg.dip_cooldown_seconds,
+        "dip_stop_cooldown_seconds": cfg.dip_stop_cooldown_seconds,
     }
 
 
@@ -67,10 +75,7 @@ def _blank_state():
 
 
 def load_state():
-    try:
-        state = json.loads(config.settings.risk_state_path.read_text())
-    except Exception:
-        state = _blank_state()
+    state = store.read(config.settings.risk_state_path, _blank_state)
 
     if state.get("day") != _today():
         manual = state.get("halted") and state.get("halt_is_manual")
@@ -87,12 +92,15 @@ def load_state():
 
 
 def save_state(state):
-    try:
-        path = config.settings.risk_state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    """Persist risk state atomically.
+
+    This file holds the halt latch. The previous version truncated the file
+    before writing it and swallowed every failure, so a process killed mid-write
+    left an unparseable file -- and the reader treated that as "no halt". A
+    breached daily loss limit could therefore un-latch itself across a crash or
+    redeploy, which defeats the entire purpose of latching it to disk.
+    """
+    store.write(config.settings.risk_state_path, state)
 
 
 def log_decision(record):
@@ -277,6 +285,18 @@ def record_trade(ticker, count, cost_cents):
     return state
 
 
+def record_cost(cost_cents):
+    """Add deployed cost to the day WITHOUT counting a new trade.
+
+    For subsequent partial fills on a resting order: the same order, so the same
+    trade for pacing purposes, but real additional money committed.
+    """
+    state = load_state()
+    state["cost_today_cents"] = int(state.get("cost_today_cents", 0)) + int(cost_cents or 0)
+    save_state(state)
+    return state
+
+
 def check(signal, balance_cents, open_position_count, open_tickers):
     """Decide whether an ENTRY may be executed.
 
@@ -300,37 +320,84 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         return False, f"Open position cap reached ({cfg.max_open_positions})", None
 
     ticker = signal.get("ticker")
+    # Note this blocks ADDING to a live position, not re-entering after one
+    # closes. Dip re-entry is sequential by design: exit, then look for the
+    # next dislocation. Averaging into an open losing dip lot is how a bad
+    # read becomes a bad day.
     if ticker and ticker in (open_tickers or []):
-        return False, f"Already scalping {ticker}", None
+        return False, f"Already holding {ticker}", None
 
-    # A market that already stopped us out is hostile to this signal right
-    # now; re-trying it over and over is how a chop session drains a day.
+    # ---- lane-specific pacing -------------------------------------------
+    # The trend lane's caps exist to stop momentum re-chasing: after a stop,
+    # the same wrong read tends to fire again within seconds. A dip lane is
+    # the opposite case -- several genuine dislocations inside one 15-minute
+    # window is normal, and it is precisely the re-entry the manual strategy
+    # depends on. So the dip lane gets its own, looser, but still bounded
+    # allowance rather than an exemption.
+    is_dip = bool(signal.get("dip"))
+    lane = signal.get("lane") or ("dip" if is_dip else "trend")
+    entry_cap = cfg.dip_max_entries_per_market if is_dip else cfg.max_entries_per_market
+    cooldown = cfg.dip_cooldown_seconds if is_dip else cfg.cooldown_seconds
+    stop_cooldown = cfg.dip_stop_cooldown_seconds if is_dip else cfg.stop_cooldown_seconds
+
     attempts = int((state.get("ticker_attempts") or {}).get(ticker) or 0)
-    if ticker and attempts >= cfg.max_entries_per_market:
+    if ticker and attempts >= entry_cap:
         return False, (
             f"Market attempt cap: already entered {ticker} {attempts}x "
-            f"(max {cfg.max_entries_per_market} per market)"
+            f"(max {entry_cap} per market on the {lane} lane)"
         ), None
 
     elapsed = time.time() - float(state.get("last_trade_at") or 0)
-    if elapsed < cfg.cooldown_seconds:
-        return False, f"Cooldown active ({int(cfg.cooldown_seconds - elapsed)}s remaining)", None
+    if elapsed < cooldown:
+        return False, f"Cooldown active ({int(cooldown - elapsed)}s remaining)", None
 
     since_stop = time.time() - float(state.get("last_stop_at") or 0)
-    if since_stop < cfg.stop_cooldown_seconds:
+    if since_stop < stop_cooldown:
         return False, (
-            f"Post-stop cooldown ({int(cfg.stop_cooldown_seconds - since_stop)}s "
-            f"remaining before entries resume)"
+            f"Post-stop cooldown ({int(stop_cooldown - since_stop)}s "
+            f"remaining before {lane} entries resume)"
         ), None
 
     price = int(signal.get("price_cents") or 0)
     if price <= 0:
         return False, "Signal carries no executable price", None
 
+    # ---- conviction sizing ----------------------------------------------
+    # The budget for THIS trade, before any of the hard caps below. A
+    # marginal-but-valid signal buys the small version; a fully-confirmed one
+    # buys the large version. This only ever narrows the range between MIN and
+    # MAX cost -- it cannot exceed MAX_COST_PER_TRADE_CENTS, and every risk
+    # cap after it still applies.
+    conviction = signal.get("conviction")
+    budget_cents = cfg.max_cost_per_trade_cents
+    if cfg.conviction_sizing and isinstance(conviction, (int, float)):
+        span = cfg.max_cost_per_trade_cents - cfg.min_cost_per_trade_cents
+        scaled = cfg.min_cost_per_trade_cents + span * max(0.0, min(100.0, float(conviction))) / 100.0
+        budget_cents = int(min(cfg.max_cost_per_trade_cents, max(cfg.min_cost_per_trade_cents, scaled)))
+
     count = min(
         cfg.max_contracts_per_trade,
-        cfg.max_cost_per_trade_cents // price,
+        budget_cents // price,
     )
+
+    # ---- what the book can actually supply -------------------------------
+    # Entries are fill-or-kill: the whole size must be available at or inside
+    # the limit price, or nothing happens at all. Sizing purely from the budget
+    # asked for contracts that were not there, so the order was killed and the
+    # bot logged "unfilled" and moved on. Cap the request at the depth we are
+    # willing to reach, and price it at the worst level we would touch so the
+    # order can actually complete.
+    levels = [
+        (int(level[0]), int(level[1]))
+        for level in (signal.get("entry_levels") or [])
+        if isinstance(level, (list, tuple)) and len(level) >= 2
+    ]
+    reachable = policy.depth_within(levels, cfg.max_entry_slippage_cents)
+
+    if cfg.depth_aware_sizing and levels:
+        if reachable < 1:
+            return False, "No resting offers within the entry slippage cap", None
+        count = min(count, reachable)
 
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
@@ -358,6 +425,68 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         count = min(count, exit_size)
 
     if count < 1:
-        return False, "Cost cap, balance, or exit liquidity allows fewer than 1 contract", None
+        return False, (
+            f"Cost cap, balance, or exit liquidity allows fewer than 1 contract "
+            f"(budget {budget_cents}c at {price}c/contract)"
+        ), None
 
-    return True, "Within limits", {"count": count, "cost_cents": count * price}
+    # ---- price the order against the ladder, not the top of book ----------
+    # The edge was measured against the best offer. Filling more contracts than
+    # rest there means paying an AVERAGE price worse than that, which spends
+    # part of the edge before the position even exists. Shrink until the edge
+    # at the average fill price still clears the fee floor. Average price is
+    # non-decreasing in size, so the largest size that clears is found by
+    # walking down; if nothing clears, the trade is refused rather than taken
+    # at a price the model never approved.
+    fill = None
+    if cfg.depth_aware_sizing and levels:
+        fair_prob = signal.get("fair_prob")
+        min_edge = signal.get("min_required_edge_cents")
+        holds_to_settlement = signal.get("late_settlement") or signal.get("favorite")
+
+        while count >= 1:
+            candidate = policy.sweep(levels, count)
+            if candidate["filled"] < count:
+                # Should not happen after the depth cap, but never send an
+                # order the book cannot fill.
+                count = candidate["filled"]
+                continue
+            if candidate["cost_cents"] > budget_cents:
+                count -= 1
+                continue
+            if (
+                isinstance(fair_prob, (int, float))
+                and isinstance(min_edge, (int, float))
+                and not holds_to_settlement
+            ):
+                edge_at_fill = float(fair_prob) * 100 - candidate["avg_price_cents"]
+                if edge_at_fill < float(min_edge):
+                    count -= 1
+                    continue
+            fill = candidate
+            break
+
+        if count < 1 or fill is None:
+            return False, (
+                "Edge does not survive the average fill price at any size "
+                "(the book is too thin to enter without giving the edge back)"
+            ), None
+
+    cost_cents = fill["cost_cents"] if fill else count * price
+    limit_price = fill["worst_price_cents"] if fill else price
+    avg_price = fill["avg_price_cents"] if fill else float(price)
+
+    return True, "Within limits", {
+        "count": count,
+        "cost_cents": cost_cents,
+        "budget_cents": budget_cents,
+        "conviction": conviction,
+        "lane": lane,
+        # The limit the order must carry for a fill-or-kill of this size to
+        # complete: the worst level it will touch, not the best.
+        "limit_price_cents": limit_price,
+        "avg_price_cents": avg_price,
+        "slippage_cents": round(avg_price - price, 3),
+        "est_entry_fee_cents": round(fill["fee_cents"], 2) if fill else None,
+        "book_depth_reachable": reachable,
+    }

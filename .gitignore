@@ -223,3 +223,9 @@ __marimo__/
 secrets/
 __pycache__/
 *.pyc
+
+# Runtime state (lot book, risk state, decision log). Never commit: it is
+# live trading history, and a stale copy checked in over a real volume would
+# resurrect closed positions.
+data/
+*.json.bak

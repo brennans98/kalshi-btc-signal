@@ -1,0 +1,77 @@
+# Dockge stack for a DRYRUN session.
+#
+# Paste this into Dockge as a new stack (Compose tab), put the values from
+# .env.example into Dockge's Environment tab, then Deploy. Nothing here places
+# an order: TRADING_MODE=dryrun runs the entire decision path and simulates the
+# round trips.
+#
+# Two things in this file are not cosmetic:
+#
+#   1. `btc-bot-data` is a NAMED VOLUME. A bind mount to a path inside the stack
+#      folder works too, but an anonymous volume or no volume at all means every
+#      redeploy forgets open positions and any latched halt. In dryrun that only
+#      costs you the session's record; in live it is a real position with no stop.
+#
+#   2. The port is bound to 127.0.0.1. The dashboard's read-only endpoint has no
+#      authentication and shows your positions, balance and P&L. The control
+#      endpoints (halt, resume, flatten) do require ADMIN_TOKEN and fail closed
+#      without one, so an open port cannot be used to trade -- but it can be used
+#      to watch you. Reach it over an SSH tunnel (see DRYRUN.md), or change this
+#      to 0.0.0.0 only if your AWS security group restricts the port to your own
+#      IP.
+
+services:
+  btc-bot:
+    # Pulled from GHCR, published by .github/workflows/ci.yml on every push to
+    # main that passes the test suite. This is why updating the server is a
+    # Dockge "Update" click and not a shell session: the image you pull is the
+    # code that passed CI. To move the server forward, pull and restart the
+    # stack -- no git on the box, no file copying.
+    image: ghcr.io/brennans98/kalshi-btc-signal:latest
+    # To build on the server instead (e.g. testing an unmerged branch), comment
+    # out `image:` above and uncomment this, with the repo checked out alongside:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    container_name: btc-bot-dryrun
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # --- the two that define this session -------------------------------
+      # dryrun: full decision path, simulated fills, places nothing.
+      TRADING_MODE: dryrun
+      # prod, deliberately. Dryrun never sends an order, and the demo
+      # environment's books are thin enough that a dryrun against them tells you
+      # about demo liquidity rather than about your strategy. Real books, no
+      # orders, is the honest test.
+      KALSHI_ENV: prod
+      DATA_DIR: /app/data
+      PORT: "8000"
+    env_file:
+      # Credentials and everything else live here, NOT in this file. Dockge's
+      # Environment tab writes this file for you.
+      - .env
+    volumes:
+      - btc-bot-data:/app/data
+    healthcheck:
+      # /health reports spot-feed connectivity and whether the trading loop is
+      # actually running, which is what "up" needs to mean here -- a container
+      # that is running with a dead feed is not healthy.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4)); sys.exit(0 if d.get('ok') else 1)\""]
+      interval: 30s
+      timeout: 6s
+      start_period: 40s
+      retries: 3
+    logging:
+      # The loop evaluates sub-second and logs its decisions. Without a cap these
+      # files grow until the EBS volume fills, which takes the bot down in a way
+      # that looks like a bug in the bot.
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 20s
+
+volumes:
+  btc-bot-data:

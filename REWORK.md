@@ -1,0 +1,356 @@
+# Rework: what changed, why, and what it does not fix
+
+This is the change record for the strategy rework. It is written to be read
+before deploying, because two of these changes alter how much money the bot
+puts at risk per position.
+
+## The four things that were actually wrong
+
+These were found by reading the code, not by guessing at strategy. They are
+listed in order of how much they were costing.
+
+### 1. The bot could not see the contract's price
+
+This was the big one. The bot read BTC's price from Coinbase and computed a
+fair value from it. It never kept any record of the *contract's* own price
+history — only the current top of book. So a Kalshi contract that had sold off
+15 cents in the last twenty seconds looked identical, to the bot, to one that
+had been sitting flat at that price all along.
+
+That is precisely the pattern being traded manually: watch the contract dip,
+buy the dip, ride the recovery. The bot was structurally incapable of seeing
+it. Not badly tuned — blind.
+
+`booktape.py` is new and fixes this. Every book update is recorded as a
+per-contract time series, and `booktape.analyze()` reports the drop from the
+window high, the rise from the low, how long ago each happened, fast and slow
+velocity, whether the fall is decelerating, and resting-size imbalance. This is
+the contract's chart.
+
+### 2. Exits ran on a book that was up to 1.5 seconds stale
+
+`app.py` already maintained a live WebSocket orderbook, applying every delta
+Kalshi pushed. But `trader.py` ignored it and fetched the book over REST with a
+1.5-second cache for every exit decision.
+
+So every stop, trail, and guard was evaluated against a price that could be a
+second and a half old, on a market that reprices several times a second. On a
+co-located server this is a self-inflicted wound: the network round trip was
+never the bottleneck — the cache was. A 3ms link is worth nothing behind a
+1500ms cache.
+
+`trader.py` now reads the in-memory book directly out of the same process. REST
+remains as a fallback for when the socket is reconnecting, gated on
+`BOOK_MAX_AGE_SECONDS`.
+
+### 3. The loop ran every 2 seconds regardless of what the market did
+
+The trading loop slept a fixed 2 seconds. Combined with the stale book, a dip
+could open and close entirely between two ticks.
+
+The loop is now event-driven: `app.py` sets an event on every book publish, and
+the loop wakes on it, falling back to `TRADE_LOOP_SECONDS` (now 0.25) as a
+heartbeat when the book is quiet. Exits are evaluated on the tick that moved
+the price. Order-status polling is throttled separately, because that is a
+rate-limited REST call and does not benefit from running faster.
+
+### 4. The exit ladder was designed to cut winners short
+
+The old profile sold 50% of a position at +3 cents, 30% at +7, 20% at +14, and
+had a chart-flip rule and a 300-second max-hold that could close a position
+that was winning.
+
+This is a coherent design — for cent-scalping. It is the opposite of riding a
+move. A position about to run 30 cents had already sold half of itself at +3.
+
+`EXIT_PROFILE=runner` is now the default. It holds, and exits on a trailing
+stop that widens with the peak (`RUNNER_TRAIL_FRAC` of the peak gain, bounded
+by `RUNNER_TRAIL_MIN_CENTS`/`RUNNER_TRAIL_MAX_CENTS`), tightens when the chart
+turns against the position, does not apply the max-hold timer to a winner, and
+rides a deep-ITM position to settlement. `EXIT_PROFILE=ladder` restores the old
+behaviour unchanged.
+
+## What was added
+
+### Consolidated spot feed with a divergence veto (`feeds.py`)
+
+Coinbase, Binance.US and Kraken now run simultaneously and are merged into a
+median print. A single venue cannot distinguish a real move from its own
+glitch, and trading a glitch is worse than missing a move.
+
+When fewer than `SPOT_MIN_SOURCES` venues are alive, or they disagree by more
+than `SPOT_DIVERGENCE_BPS`, entries stop. Not "pick the majority" — stop. One
+of the feeds is wrong and nothing in this process can tell which.
+
+Nothing in `feeds.py` is ever awaited on the order path. The only feed an order
+may block on is the Kalshi L2 book.
+
+### Dip and reversion entry lanes (`policy.py`)
+
+Two new lanes, evaluated *before* the momentum gates — which are hostile to dip
+buying by design, since a dip is by definition a move against the recent trend:
+
+- **`dip_dislocation`** — the contract dropped while spot did not. This is the
+  discount case, and `DIP_MAX_SPOT_MOVE_BPS` is the load-bearing setting: if
+  spot really moved, the contract is *repriced*, not discounted, and buying it
+  is taking the wrong side of a real move.
+- **`dip_reversion`** — a deeper drop with the contract back near fair.
+
+The lanes do **not** bypass the price band, spread cap, exit-liquidity check,
+or fee floors. They are additional lanes, not an override, and they require the
+fall to have decelerated (`DIP_REQUIRE_DECEL`) before buying — otherwise this
+is a knife-catching machine.
+
+### Conviction scoring and sizing
+
+Every signal now carries a 0–100 conviction score blended from drop size, edge
+over the fee floor, book imbalance, deceleration, and time remaining. With
+`CONVICTION_SIZING=1` the per-trade budget scales linearly from
+`MIN_COST_PER_TRADE_CENTS` ($5) to `MAX_COST_PER_TRADE_CENTS` ($20). A marginal
+signal buys the small version; a fully confirmed one buys the large version.
+
+Every hard risk cap still applies on top and can only ever reduce the result.
+
+### Lane-specific pacing
+
+The trend lane's 2-entries-per-market cap exists to stop momentum re-chasing
+after a stop. Applied to dips it would forbid exactly the re-entry behaviour
+that worked manually, so the dip lane has its own looser bounds
+(`DIP_MAX_ENTRIES_PER_MARKET=4`, `DIP_COOLDOWN_SECONDS=8`).
+
+Adding to an *open* position is still refused. Re-entry means after an exit;
+averaging into a losing dip lot is how a bad read becomes a bad day.
+
+## Size change — read this before deploying
+
+`MAX_COST_PER_TRADE_CENTS` changed from **500 to 2000**, and
+`MAX_CONTRACTS_PER_TRADE` from **6 to 60**.
+
+The contract-count cap was the binding constraint before, and it was binding
+much lower than intended: at a 40c ask, six contracts is $2.40, not $20. So the
+bot was trading roughly a tenth of the intended size. Fixing the cost cap
+without fixing the count cap would have changed nothing; fixing both is what
+makes a $20 position actually cost $20.
+
+This means **each position now risks up to 4x what it did before.** The daily
+loss limit (`DAILY_LOSS_LIMIT_CENTS` / `DAILY_LOSS_LIMIT_PCT`) has not changed
+and still bounds the day, but it will now be reached in fewer trades. Set the
+caps to what you actually intend before enabling live trading.
+
+## Deploy checklist
+
+1. **Set the new variables.** All defaults are in `.env.example`. The defaults
+   are usable, but `MAX_COST_PER_TRADE_CENTS` and `DAILY_LOSS_LIMIT_CENTS` are
+   money decisions and should be set deliberately rather than inherited.
+2. **`DATA_DIR` must be a named volume.** Risk state, the halt latch, and open
+   lots live there. If it is container-local storage, a redeploy silently
+   forgets open positions and clears a latched halt — a restart must not be a
+   reset.
+3. **Run `TRADING_MODE=dryrun` first, for at least a few full market cycles.**
+   Then read the decision log rather than the summary. The specific thing to
+   check: dip entries firing on contract drops with a quiet spot, and *not*
+   firing when spot moved with the contract.
+4. **Then demo money** (`KALSHI_ENV=demo`), then live at the smallest size
+   limits, and only then the size you want.
+5. **Watch `spot_feeds` on `/api/state`.** If venues are frequently diverging,
+   the veto will be blocking entries and that is the feed's problem to fix, not
+   a threshold to raise.
+
+## Tests
+
+`tests/test_strategy.py` covers the tape's drop/rise measurement and YES/NO
+mirroring, the dip lane firing on a dislocation and refusing both a still-falling
+knife and a drop matched by the underlying, the divergence and
+insufficient-sources vetoes, the trail's monotonicity and bounds, conviction
+sizing staying inside $5–$20, and the lane-specific re-entry allowance.
+
+These prove the code computes what it claims to compute. They prove nothing
+about profitability. A backtest against recorded book data is the next honest
+step, and even that would not settle it.
+
+## What this does not fix
+
+The uploaded plan document put it correctly, and it is worth repeating here
+rather than burying: no set of edits makes a live-money bot "perfect," and
+nobody can guarantee profit on a binary market. Anyone promising that is
+selling confidence, not engineering.
+
+Specifically:
+
+- **The dip lane is a hypothesis, not a fact.** It encodes the belief that
+  short-term contract dips with a steady underlying tend to revert. That belief
+  is plausible and it is what the manual trading appears to have exploited, but
+  it has not been measured on this market. It could be a real inefficiency, or
+  it could be that the dips were selling off for a reason the tape does not
+  contain — a large informed order, for instance.
+- **A run of profitable $5–$20 manual trades is not yet distinguishable from a
+  good streak in a favourable regime.** That is not scepticism about the
+  trading; it is what a small sample cannot tell you. The bot's advantage over
+  manual trading is that it will produce a large enough sample to find out.
+- **Latency is now genuinely exploited, but latency is not edge.** It removes a
+  handicap. Reacting instantly to a signal that is wrong just loses money
+  faster, which is why the divergence veto and the deceleration requirement
+  matter more than the loop cadence.
+- **The market makers on KXBTC15M are pricing these contracts efficiently and
+  are also co-located.** The realistic goal is a small, real edge in specific
+  conditions, not a structural advantage over everyone.
+
+## Hardening pass: the failure modes that lose money by breaking
+
+The rework above changes what the bot decides. This pass changes what happens
+when the process dies at the worst possible moment. These are a different class
+of defect: not "wrong about the market" but "broken", and they were all silent.
+
+### 1. State writes were not atomic (`store.py`)
+
+`path.write_text(json.dumps(...))` truncates the file, then writes it. A process
+killed between those two steps — a redeploy, an OOM kill, a host restart — leaves
+a half-written file. The reader caught the parse error and returned blank state.
+
+So the real behaviour was:
+
+- **`scalp.py`**: open positions silently forgotten. The lot book holds the entry
+  basis and the running peak; without it the bot no longer knows it has a
+  position, or what it paid.
+- **`risk.py`**: **a latched halt silently cleared.** The daily loss limit writes
+  `halted: true` to disk specifically so it survives a restart. A torn write made
+  the reader see "no halt" and resume trading. A halt that clears itself on a
+  crash is not a safety mechanism.
+
+Now: write to a temp file in the same directory, `fsync`, then `os.replace`,
+which is atomic on POSIX — a reader sees either the complete old file or the
+complete new one, never a partial. The last committed state is also kept as a
+`.bak`, written *after* the primary succeeds so it always holds the last good
+revision rather than trailing one behind.
+
+### 2. Write failures were swallowed
+
+Both save paths ended in `except Exception: pass`. A full disk or a read-only
+volume discarded every subsequent write while the bot traded on as though it had
+saved — and would only find out at the next restart, having forgotten everything
+since the first failure. Writes now raise, and `/api/state` carries
+`trader.storage` with `healthy`, any active `errors`, and a sticky
+`recovered_from_corruption` flag. If that flag is set, the process was killed
+mid-write at some point; the state was recovered, but you should know it happened.
+
+### 3. Disk I/O sat in the hot exit path
+
+Every `load()` read and parsed JSON from disk, and `mark()` — which runs for
+every open lot on every tick — wrote it back. That was tolerable on a 2-second
+loop. On the new event-driven sub-second loop it put filesystem latency directly
+in front of every stop and trail evaluation, which is precisely the path the
+co-location is for.
+
+Now state is cached in memory and written through. Reads never touch the disk.
+Per-tick mark updates use `store.write_lazy()`: memory updates immediately, so
+the trail always reads the true peak, while the disk write is coalesced to at
+most once a second and flushed at the *end* of the tick, never in front of an
+exit. Entries, exits and halts still write synchronously and durably — those are
+the events you cannot reconstruct.
+
+### 4. The event loop could spin
+
+`await asyncio.wait_for(event.wait(), ...)` followed by `event.clear()` returns
+immediately if the book updated while the tick was still running — which on a
+fast tape is most of the time. The loop would never yield: one core pinned, and
+scheduling jitter added to the exit path. `TRADE_LOOP_MIN_SECONDS` (default
+0.02) is now awaited before the wait. 20ms is far below any timescale the
+strategy reasons about and it bounds the spin.
+
+### 5. Dangerous-but-legal configurations are now surfaced
+
+`config.settings.cautions()` reports combinations that are valid — so they must
+not block startup — but interact in ways that are easy to set by accident and
+expensive to discover live. They appear as `config_cautions` in `/api/state`.
+
+**One fires on the current defaults, and it is a direct consequence of raising
+position size:** `MAX_COST_PER_TRADE_CENTS` is now 2000 ($20) while
+`DAILY_LOSS_LIMIT_CENTS` is also 2000 ($20). One full-size losing position can
+therefore consume the entire daily budget and latch the halt for the rest of the
+day. That may be what you want. If it is not, raise `DAILY_LOSS_LIMIT_CENTS` to
+roughly 2–3× max position size. **This default was deliberately left alone —
+raising someone's loss limit is not a decision code should make quietly.**
+
+### What this still does not fix
+
+Nothing here makes the strategy more likely to be right. It removes ways for the
+bot to lose money by malfunctioning rather than by being wrong. The market
+exposure is unchanged, and no amount of this work makes a position on a binary
+market safe.
+
+## Pass 3 — execution accuracy
+
+Predictive accuracy on a 15-minute binary market cannot approach 100%; anything
+claiming otherwise is selling confidence. **Execution** accuracy can: given a
+decision, the bot should carry it out exactly, price it correctly, and report the
+result truthfully, every time. This pass audited every action for that, and every
+fix below is covered by a test in `tests/test_execution.py` that fails without it.
+
+### Realized P&L was gross, not net
+
+`record_exit` returned the raw price difference. A taker round trip on this market
+costs roughly 3–4c per contract and a scalp targets a handful of cents, so gross
+P&L does not merely flatter the record — it can invert its sign. A strategy
+averaging +2c gross per contract is losing money, and the old number called it a
+win. P&L is now net of fees, with `realized_gross_cents` and `fees_cents` reported
+alongside so the cost of trading is visible rather than silently absorbed.
+
+Entry fees are stored per contract on the lot (the exchange's `average_fee_paid`
+when available, otherwise the published taker formula — the conservative
+assumption) and apportioned across partial exits, so scaling out is not charged
+the entry fee repeatedly. Settlement is fee-free and passes an explicit zero.
+
+### Exits were booked at the limit price, not the fill price
+
+A sell IOC at limit P fills against bids at or above P, so the average fill is at
+least as good as the limit. Recording the limit understated every profitable exit.
+Exits now use the exchange's reported VWAP and its actual fee. In dryrun, where
+assumptions *are* the record, the assumptions are deliberately pessimistic: fill
+at the limit, pay the taker rate.
+
+### Rounding drift across partial exits
+
+Each partial exit rounded its own P&L to a whole cent, so a lot exited in halves
+lost a cent against a lot exited at once. Totals now accumulate in exact
+fractional cents and are rounded only for display. Money rounding is explicit
+half-up, because Python's `round(12.5)` is 12 — surprising and biased for money.
+
+### Resting orders that filled in pieces understated the day's deployment
+
+`record_trade` was called once per resting order, so contracts that filled later
+never reached `cost_today_cents`. Subsequent fills now call `record_cost`, which
+adds deployed money without counting a new trade — the same order is still one
+trade for pacing purposes.
+
+### Clock drift is now a trading fault
+
+The market expires on the exchange's clock; every deadline in this bot is measured
+against the local one. A clock running behind makes the bot believe it has more
+time than it does, which delays the settlement guard and can leave a position
+unexited at expiry — a total loss on that position rather than a small one.
+
+The client now estimates its offset from the exchange on every HTTP response
+(server `Date` header, compared against the request midpoint so latency is not
+mistaken for drift, exponentially smoothed). The estimate can only ever *shorten*
+the trading window, never widen it, and is bounded at 30s. Beyond two minutes it
+is treated as a broken clock and trading stops, because a wildly wrong skew
+applied as a correction would silently halt trading while looking like a strategy
+that found no setups. Clock health is on the dashboard payload.
+
+`close_epoch` also now treats a timezone-less close time as UTC. `datetime.timestamp()`
+reads a naive datetime as *local* time, which would put the close hours away —
+a silent, total failure rather than a noisy partial one.
+
+### Two bugs the tests caught while being written
+
+- The mirrored ask ladder was built worst-first, which would have priced every
+  sweep at the worst level on the book.
+- A broken clock reported "feed is stale", because the feed-age check ran first
+  and also uses the local clock. An accurate veto for the wrong reason is still a
+  debugging trap, so the clock check runs first.
+
+### What this does not do
+
+None of this improves prediction. It makes the bot's own record trustworthy, which
+is the prerequisite for judging whether the prediction is any good — the previous
+numbers were optimistic in at least three independent ways at once.
