@@ -41,24 +41,64 @@ After that one-time setup, **code changes do flow automatically**:
 So: compose and secrets are yours to enter once; the code that runs is whatever
 passed CI. Nothing reaches your server without you pressing Update.
 
-### One-time: let the server pull the image
+### One-time: let Dockge pull the private image
 
 The GHCR package is private, which is correct — the image layers contain the
-source. A private package cannot be pulled anonymously, so log the Docker daemon
-in once, on the server:
+strategy source. Pulling it needs a credential, and *where* that credential lives
+matters more than it looks.
 
-```bash
-# A classic PAT with read:packages scope is enough. Not a fine-grained token --
-# GHCR still wants a classic one for this.
-echo "$GHCR_PAT" | docker login ghcr.io -u brennans98 --password-stdin
+Dockge itself runs in a container and shells out to the Docker CLI from inside it.
+So `docker login` on the host writes `/root/.docker/config.json` on the host,
+which the Dockge container cannot see. Dockge's own compose file carries a
+commented-out line for exactly this reason
+([Dockge](https://github.com/louislam/dockge)):
+
+```yaml
+# If you want to use private registries, you need to share the auth file with Dockge:
+# - /root/.docker/:/root/.docker
 ```
 
-That credential persists in `~/.docker/config.json`, so it is a one-time step.
-If `docker pull` returns `denied`, this login is what is missing.
+First, get a token: GitHub → Settings → Developer settings → Personal access
+tokens → **Tokens (classic)** → scope `read:packages`. It must be a classic token;
+GHCR does not accept fine-grained ones for this. If the pull still returns
+`denied` with `read:packages` set, add the `repo` scope — private-repo packages
+can inherit permission from the repository.
 
-The alternative is making the package public in the repo's package settings. It
-holds no secrets — credentials are injected at runtime, never baked in — but it
-would publish your strategy code, so prefer the login.
+**Quickest, no SSH.** In Dockge, open a shell on the `dockge` container itself and
+log in there — that is the client that performs the pull
+([Dockge discussion #98](https://github.com/louislam/dockge/discussions/98)):
+
+```bash
+docker login ghcr.io -u brennans98
+# paste the classic PAT when prompted for a password
+```
+
+This works immediately. Its one weakness: the credential lives in the Dockge
+container's own filesystem, so recreating or updating Dockge loses it and the
+next pull fails with `denied`. Re-run the login if that happens.
+
+**Permanent.** Log in on the host and share the file with Dockge:
+
+```bash
+sudo docker login ghcr.io -u brennans98      # writes /root/.docker/config.json
+```
+
+Then add this to the `volumes:` of **Dockge's own** stack and restart Dockge:
+
+```yaml
+      - /root/.docker/:/root/.docker
+```
+
+Either way, prove it before deploying the bot:
+
+```bash
+docker pull ghcr.io/brennans98/kalshi-btc-signal:latest
+```
+
+The remaining alternative is making the package public in its package settings.
+It holds no secrets — credentials are injected at runtime, never baked into the
+image — but it would publish your strategy code to anyone who looks, so prefer
+the login.
 
 ## 1. Deploy the stack
 
