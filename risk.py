@@ -43,6 +43,12 @@ def limits():
         "per_trade_risk_pct": cfg.per_trade_risk_pct,
         "cooldown_seconds": cfg.cooldown_seconds,
         "stop_cooldown_seconds": cfg.stop_cooldown_seconds,
+        "conviction_sizing": bool(cfg.conviction_sizing),
+        "min_cost_per_trade_cents": cfg.min_cost_per_trade_cents,
+        "max_entries_per_market": cfg.max_entries_per_market,
+        "dip_max_entries_per_market": cfg.dip_max_entries_per_market,
+        "dip_cooldown_seconds": cfg.dip_cooldown_seconds,
+        "dip_stop_cooldown_seconds": cfg.dip_stop_cooldown_seconds,
     }
 
 
@@ -300,36 +306,64 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         return False, f"Open position cap reached ({cfg.max_open_positions})", None
 
     ticker = signal.get("ticker")
+    # Note this blocks ADDING to a live position, not re-entering after one
+    # closes. Dip re-entry is sequential by design: exit, then look for the
+    # next dislocation. Averaging into an open losing dip lot is how a bad
+    # read becomes a bad day.
     if ticker and ticker in (open_tickers or []):
-        return False, f"Already scalping {ticker}", None
+        return False, f"Already holding {ticker}", None
 
-    # A market that already stopped us out is hostile to this signal right
-    # now; re-trying it over and over is how a chop session drains a day.
+    # ---- lane-specific pacing -------------------------------------------
+    # The trend lane's caps exist to stop momentum re-chasing: after a stop,
+    # the same wrong read tends to fire again within seconds. A dip lane is
+    # the opposite case -- several genuine dislocations inside one 15-minute
+    # window is normal, and it is precisely the re-entry the manual strategy
+    # depends on. So the dip lane gets its own, looser, but still bounded
+    # allowance rather than an exemption.
+    is_dip = bool(signal.get("dip"))
+    lane = signal.get("lane") or ("dip" if is_dip else "trend")
+    entry_cap = cfg.dip_max_entries_per_market if is_dip else cfg.max_entries_per_market
+    cooldown = cfg.dip_cooldown_seconds if is_dip else cfg.cooldown_seconds
+    stop_cooldown = cfg.dip_stop_cooldown_seconds if is_dip else cfg.stop_cooldown_seconds
+
     attempts = int((state.get("ticker_attempts") or {}).get(ticker) or 0)
-    if ticker and attempts >= cfg.max_entries_per_market:
+    if ticker and attempts >= entry_cap:
         return False, (
             f"Market attempt cap: already entered {ticker} {attempts}x "
-            f"(max {cfg.max_entries_per_market} per market)"
+            f"(max {entry_cap} per market on the {lane} lane)"
         ), None
 
     elapsed = time.time() - float(state.get("last_trade_at") or 0)
-    if elapsed < cfg.cooldown_seconds:
-        return False, f"Cooldown active ({int(cfg.cooldown_seconds - elapsed)}s remaining)", None
+    if elapsed < cooldown:
+        return False, f"Cooldown active ({int(cooldown - elapsed)}s remaining)", None
 
     since_stop = time.time() - float(state.get("last_stop_at") or 0)
-    if since_stop < cfg.stop_cooldown_seconds:
+    if since_stop < stop_cooldown:
         return False, (
-            f"Post-stop cooldown ({int(cfg.stop_cooldown_seconds - since_stop)}s "
-            f"remaining before entries resume)"
+            f"Post-stop cooldown ({int(stop_cooldown - since_stop)}s "
+            f"remaining before {lane} entries resume)"
         ), None
 
     price = int(signal.get("price_cents") or 0)
     if price <= 0:
         return False, "Signal carries no executable price", None
 
+    # ---- conviction sizing ----------------------------------------------
+    # The budget for THIS trade, before any of the hard caps below. A
+    # marginal-but-valid signal buys the small version; a fully-confirmed one
+    # buys the large version. This only ever narrows the range between MIN and
+    # MAX cost -- it cannot exceed MAX_COST_PER_TRADE_CENTS, and every risk
+    # cap after it still applies.
+    conviction = signal.get("conviction")
+    budget_cents = cfg.max_cost_per_trade_cents
+    if cfg.conviction_sizing and isinstance(conviction, (int, float)):
+        span = cfg.max_cost_per_trade_cents - cfg.min_cost_per_trade_cents
+        scaled = cfg.min_cost_per_trade_cents + span * max(0.0, min(100.0, float(conviction))) / 100.0
+        budget_cents = int(min(cfg.max_cost_per_trade_cents, max(cfg.min_cost_per_trade_cents, scaled)))
+
     count = min(
         cfg.max_contracts_per_trade,
-        cfg.max_cost_per_trade_cents // price,
+        budget_cents // price,
     )
 
     if balance_cents is not None:
@@ -358,6 +392,15 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         count = min(count, exit_size)
 
     if count < 1:
-        return False, "Cost cap, balance, or exit liquidity allows fewer than 1 contract", None
+        return False, (
+            f"Cost cap, balance, or exit liquidity allows fewer than 1 contract "
+            f"(budget {budget_cents}c at {price}c/contract)"
+        ), None
 
-    return True, "Within limits", {"count": count, "cost_cents": count * price}
+    return True, "Within limits", {
+        "count": count,
+        "cost_cents": count * price,
+        "budget_cents": budget_cents,
+        "conviction": conviction,
+        "lane": lane,
+    }

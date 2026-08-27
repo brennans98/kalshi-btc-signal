@@ -194,9 +194,22 @@ def ladder_allocation(count):
 
 
 def record_entry(
-    mode, ticker, side, count, entry_price, close_epoch=None, stop_cents=None, settle_only=False
+    mode,
+    ticker,
+    side,
+    count,
+    entry_price,
+    close_epoch=None,
+    stop_cents=None,
+    settle_only=False,
+    lane=None,
+    conviction=None,
 ):
     """Open (or add to) a lot. Averages the basis if a lot already exists.
+
+    lane and conviction are the signal's provenance: which entry path fired
+    and how strong it read (0-100). Stored per lot so the trade record can be
+    grouped by lane afterwards.
 
     stop_cents is the volatility-scaled stop the signal computed at entry
     time; it is stored on the lot so plan() honors the stop the trade was
@@ -230,6 +243,10 @@ def record_entry(
             existing["stop_cents"] = int(stop_cents)
         if settle_only:
             existing["settle_only"] = True
+        if lane:
+            existing["lane"] = lane
+        if conviction is not None:
+            existing["conviction"] = int(conviction)
         existing["tiers_done"] = []
         existing["peak_gain"] = 0
         state["lots"][lot_key] = existing
@@ -244,6 +261,11 @@ def record_entry(
             "close_epoch": close_epoch,
             "stop_cents": int(stop_cents) if stop_cents else None,
             "settle_only": bool(settle_only),
+            # Which entry lane opened this lot, and how convinced it was. Kept
+            # on the lot so post-hoc analysis can compare lanes honestly --
+            # "the dip lane is working" needs to be checkable, not assumed.
+            "lane": lane,
+            "conviction": None if conviction is None else int(conviction),
             "tiers_done": [],
             "peak_gain": 0,
             "last_bid": entry_price,
@@ -285,6 +307,123 @@ def _riding_to_settlement(cfg, bid, gain):
         and gain > 0
         and bid >= cfg.settle_ride_min_bid_cents
     )
+
+
+def runner_trail_cents(cfg, peak, opposed=False):
+    """How far below the peak the trailing stop sits, in cents.
+
+    None until the lot is RUNNER_ARM_CENTS in profit -- before that the hard
+    stop is the only protection, because a trail on an underwater lot is just
+    a tighter stop wearing a costume.
+
+    Once armed the trail is RUNNER_TRAIL_FRAC of the peak gain, clamped to
+    [MIN, MAX]. The shape matters: at a 6c peak the trail is the 5c floor, so
+    the lot has room to breathe; at a 30c peak it is the 12c cap, which is
+    only 40% of the move rather than the 100% a fixed 3c rung would have
+    surrendered by exiting at +3c. That is the whole difference between
+    scalping cents and riding a move.
+
+    A trend flip against a winning lot tightens the trail by RUNNER_FLIP_TIGHTEN
+    instead of dumping the position -- protecting the gain without paying a
+    spread every time the EMAs cross.
+    """
+    if peak < cfg.runner_arm_cents:
+        return None
+    trail = cfg.runner_trail_frac * peak
+    trail = max(float(cfg.runner_trail_min_cents), min(float(cfg.runner_trail_max_cents), trail))
+    if opposed:
+        trail = max(1.0, trail * cfg.runner_flip_tighten)
+    return trail
+
+
+def _plan_runner(cfg, lot, bid, now, gain, peak, stop_cents, remaining, limit_price, flatten, trend):
+    """The runner exit engine: hold winners, protect them with a trail.
+
+    The hard stop has already been checked by the caller and is identical in
+    both profiles. What differs is everything about a WINNING lot:
+
+      * no fixed profit rungs, so a winner is never capped at +3c
+      * a trend flip tightens the trail instead of closing the position
+      * max-hold does not evict a lot that is in profit and still onside
+      * deep ITM still rides to fee-free settlement
+
+    The cost of this is real and worth stating: every winner gives back part
+    of its peak, and trades that would have banked +3c under the ladder will
+    sometimes come back and stop out instead. It pays for that with the
+    winners the ladder used to cut off at the knees.
+    """
+    opposed = trend in ("up", "down") and (
+        (lot["side"] == "yes" and trend == "down") or (lot["side"] == "no" and trend == "up")
+    )
+    riding = _riding_to_settlement(cfg, bid, gain)
+
+    # A losing lot with the chart now against it: the reason for holding is
+    # gone, so cut rather than donate the rest of the stop distance.
+    if cfg.chart_exit and opposed and gain <= cfg.chart_exit_max_gain_cents:
+        return flatten(
+            "chart",
+            f"Chart flip: trend turned '{trend}' against this {lot['side'].upper()} "
+            f"lot at {gain:+.0f}c -- cutting now instead of riding to the "
+            f"{stop_cents}c stop",
+        )
+
+    # The trailing stop. Checked before the time-based exits so a winner that
+    # has rolled over exits on price, with a reason that says why.
+    trail = runner_trail_cents(cfg, peak, opposed)
+    if trail is not None and (peak - gain) >= trail:
+        return flatten(
+            "trail",
+            f"Trailing exit: gave back {peak - gain:.1f}c from a {peak:.1f}c peak "
+            f"(trail {trail:.1f}c"
+            + (", tightened on trend flip" if opposed else "")
+            + f", banking {gain:+.1f}c)",
+        )
+
+    if lot.get("close_epoch"):
+        seconds_left = lot["close_epoch"] - now
+        if seconds_left <= cfg.settlement_guard_seconds:
+            if riding:
+                return []
+            return flatten(
+                "time",
+                f"Settlement guard: {int(seconds_left)}s to close, flattening "
+                f"rather than holding a binary",
+            )
+
+    held_for = now - (lot.get("opened_at") or now)
+    if held_for >= cfg.max_hold_seconds and not riding:
+        # Max-hold exists to evict lots that are going nowhere. A lot in
+        # profit with the trend still onside is not going nowhere, and
+        # evicting it is exactly the behaviour that capped winners.
+        working = cfg.runner_hold_winners and gain > 0 and not opposed
+        if not working:
+            return flatten(
+                "time",
+                f"Max hold reached ({int(held_for)}s) at {gain:+.0f}c",
+            )
+
+    # Optional single de-risk slice. Off by default: it is the cent-scalping
+    # this profile exists to avoid, and is here only for whoever wants it.
+    if cfg.runner_partial_pct > 0 and "runner_partial" not in (lot.get("tiers_done") or []):
+        original = lot.get("count_original") or remaining
+        if gain >= cfg.runner_partial_cents and original >= 2:
+            count = min(remaining, max(1, math.floor(original * cfg.runner_partial_pct / 100)))
+            if count > 0:
+                return [
+                    {
+                        "tier": "runner_partial",
+                        "kind": "profit",
+                        "count": count,
+                        "limit_price": limit_price,
+                        "reason": (
+                            f"De-risk slice: +{gain:.0f}c reached the "
+                            f"{cfg.runner_partial_cents}c partial, selling "
+                            f"{cfg.runner_partial_pct}% and letting the rest run"
+                        ),
+                    }
+                ]
+
+    return []
 
 
 def plan(lot, bid, now=None, include_profit=True, trend=None):
@@ -333,8 +472,15 @@ def plan(lot, bid, now=None, include_profit=True, trend=None):
         ]
 
     # --- exits that override the ladder, in priority order ---------------
+    # The hard stop is profile-independent: it is the one exit that is never
+    # negotiable, and it is checked before anything else in both engines.
     if gain <= -stop_cents:
         return flatten("stop", f"Stop hit: {gain:.0f}c against a {stop_cents}c stop")
+
+    if cfg.exit_profile == "runner":
+        return _plan_runner(
+            cfg, lot, bid, now, gain, peak, stop_cents, remaining, limit_price, flatten, trend
+        )
 
     if cfg.chart_exit and trend in ("up", "down"):
         opposed = (lot["side"] == "yes" and trend == "down") or (
@@ -529,6 +675,15 @@ def view(mode):
                     cfg, bid, None if bid is None else bid - lot["entry_price"]
                 ),
                 "tiers_hit": lot.get("tiers_done") or [],
+                "lane": lot.get("lane"),
+                "conviction": lot.get("conviction"),
+                # Where the trailing stop currently sits, so the dashboard
+                # shows the live exit level rather than a static rung.
+                "trail_cents": (
+                    None
+                    if cfg.exit_profile != "runner" or lot.get("settle_only")
+                    else runner_trail_cents(cfg, max(lot.get("peak_gain", 0), gain or 0))
+                ),
                 "held_seconds": int(time.time() - (lot.get("opened_at") or time.time())),
                 "seconds_to_close": (
                     int(lot["close_epoch"] - time.time()) if lot.get("close_epoch") else None

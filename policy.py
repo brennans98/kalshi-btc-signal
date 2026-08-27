@@ -26,6 +26,37 @@ later because the fixed 6c stop sat inside the tape's normal wiggle.
 
 Every rejection returns a specific reason. "Expected move 1.8c short of the 3c
 small target" is debuggable; a bare NO TRADE is not.
+
+The dip lanes
+-------------
+The gates above describe a momentum model, and they are explicitly hostile to
+buying a falling contract -- correctly, for a momentum trade. But the manual
+trade being replicated here is the opposite one: a contract gaps 9c lower, the
+fall decelerates, the bid rebuilds, and it recovers. That trade was previously
+unreachable for two reasons. The bot had no record of the contract's own price
+(only BTC spot), and the trend/RSI/support gates rejected the setup by design.
+
+So the dip lanes are a separate path, reading booktape.py, with their own
+gates rather than a relaxation of these ones:
+
+  dislocation -- the contract fell hard while SPOT BARELY MOVED. Nothing
+                 justifies the new price, so the model's fair value is the
+                 reference and the edge is mechanical.
+  reversion   -- spot did move, and the contract overshot it. This is a real
+                 fade, so it demands a deeper drop, exhaustion on the spot
+                 read, and scores lower conviction.
+
+Both still require, without exception: the fall to have stopped (velocity
+decelerating), model edge above the fee floor, a two-sided book inside the
+spread cap, real resting size to exit into, and enough time left for the
+recovery to happen. A dip with no edge is not a discount, it is a contract
+that has been correctly repriced.
+
+Conviction
+----------
+Every tradable signal carries a 0-100 conviction score blended from several
+independent confirmations. risk.py turns it into position size, which is how
+one engine covers both the $5 marginal setup and the $20 fully-confirmed one.
 """
 
 import math
@@ -33,6 +64,7 @@ import os
 import time
 from datetime import datetime
 
+import booktape
 import config
 import indicators
 
@@ -315,13 +347,60 @@ def book_snapshot(orderbook):
     }
 
 
+def spot_move_bps(trades, seconds):
+    """Signed move of the spot tape over the last `seconds`, in bps.
+
+    Used by the dislocation test: a contract that fell 9c while spot barely
+    moved is a book event, not a repricing. None when the tape does not reach
+    back far enough to answer honestly.
+    """
+    if not trades:
+        return None
+    now = trades[-1][0]
+    cutoff = now - seconds
+    if trades[0][0] > cutoff:
+        return None
+    reference = None
+    for timestamp, price in reversed(trades):
+        if timestamp <= cutoff:
+            reference = price
+            break
+    if reference is None or reference <= 0:
+        return None
+    return (trades[-1][1] - reference) / reference * 10000.0
+
+
+def _clamp01(value):
+    return max(0.0, min(1.0, value))
+
+
+def _score(*parts):
+    """Weighted 0-100 conviction from (weight, 0-1 component) pairs.
+
+    Conviction is what sizing reads: it is the difference between the $5
+    version of a trade and the $20 version. It is deliberately a blend of
+    several independent confirmations rather than one number scaled up, so a
+    single extreme input cannot manufacture full size on its own.
+    """
+    total_weight = sum(weight for weight, _ in parts)
+    if total_weight <= 0:
+        return 0
+    blended = sum(weight * _clamp01(value) for weight, value in parts) / total_weight
+    return int(round(100 * blended))
+
+
 def bid_for_side(snapshot, side):
     """The price we could sell this side into right now."""
     return (snapshot or {}).get("yes_bid" if side == "yes" else "no_bid")
 
 
-def evaluate(trades, market, orderbook):
-    """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'."""
+def evaluate(trades, market, orderbook, spot_status=None):
+    """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'.
+
+    spot_status is feeds.SpotHub.status(): the per-venue health of the
+    consolidated spot tape. Passed in rather than imported so this stays a
+    pure function of its inputs and remains testable with synthetic data.
+    """
     cfg = config.settings
 
     if not trades:
@@ -329,7 +408,27 @@ def evaluate(trades, market, orderbook):
 
     spot_age = time.time() - trades[-1][0]
     if spot_age > cfg.stale_feed_seconds:
-        return _no_trade(f"Coinbase BTC feed is stale ({spot_age:.0f}s since last trade)")
+        return _no_trade(f"Consolidated BTC feed is stale ({spot_age:.0f}s since last print)")
+
+    # ---- cross-feed agreement -------------------------------------------
+    # Fair value is a function of spot, so the moment the venues stop
+    # agreeing about spot, fair value is fiction. Both of these are no-trade
+    # reasons rather than errors: the feeds keep running, the bot just stops
+    # acting on them.
+    if spot_status:
+        fresh_sources = spot_status.get("fresh_sources") or 0
+        if fresh_sources < cfg.spot_min_sources:
+            return _no_trade(
+                f"Only {fresh_sources} fresh spot feed(s), "
+                f"{cfg.spot_min_sources} required for cross-confirmation"
+            )
+        divergence = spot_status.get("divergence_bps")
+        if divergence is not None and divergence > cfg.spot_divergence_bps:
+            return _no_trade(
+                f"Spot feeds disagree by {divergence:.1f}bps "
+                f"(limit {cfg.spot_divergence_bps:.1f}bps) -- fair value is not "
+                f"trustworthy while the venues are apart"
+            )
 
     history = trades[-1][0] - trades[0][0]
     if history < cfg.min_history_seconds:
@@ -409,6 +508,13 @@ def evaluate(trades, market, orderbook):
 
     chart = indicators.analyze(trades)
 
+    # The contract's own chart, for the side we would buy, plus how far spot
+    # actually travelled over the same window. Together these separate "the
+    # contract fell because BTC fell" from "the contract fell because someone
+    # dumped into a thin book" -- the distinction the dip lanes are built on.
+    tape = booktape.analyze(market.get("ticker"), side)
+    spot_bps = spot_move_bps(trades, cfg.dip_lookback_seconds)
+
     # The stop this entry will carry: STOP_VOL_MULT times the expected
     # one-minute contract move, clamped. A 6c stop in a tape that routinely
     # wiggles 8c a minute is a coin-flip donation; the same 6c in a dead tape
@@ -474,6 +580,11 @@ def evaluate(trades, market, orderbook):
         "stop_price_cents": max(1, ask - stop_cents),
         "late_settlement": late_window,
         "favorite": False,
+        "lane": None,
+        "conviction": 0,
+        "dip": False,
+        "contract_chart": tape,
+        "spot_move_bps": None if spot_bps is None else round(spot_bps, 1),
     }
 
     # ---- the favorite fallback ------------------------------------------
@@ -504,8 +615,16 @@ def evaluate(trades, market, orderbook):
         }
         favorite.update(diagnostics)
         favorite["favorite"] = True
+        favorite["lane"] = "favorite"
         favorite["stop_cents"] = ask
         favorite["stop_price_cents"] = None
+        # A settle-held favorite risks its whole premium, so conviction leans
+        # on the model's certainty rather than on how far price might travel.
+        favorite["conviction"] = _score(
+            (3.0, (prob - cfg.fav_min_fair_prob) / max(0.01, 1.0 - cfg.fav_min_fair_prob)),
+            (2.0, (edge - cfg.fav_min_edge_cents) / max(1.0, 3 * cfg.fav_min_edge_cents)),
+            (1.0, 1.0 if chart["trend"] == ("up" if side == "yes" else "down") else 0.4),
+        )
 
     # ---- the conviction hold ---------------------------------------------
     # The third lane, and the one that pays for the whole strategy when it
@@ -556,8 +675,15 @@ def evaluate(trades, market, orderbook):
             favorite.update(diagnostics)
             favorite["favorite"] = True
             favorite["hold_lock"] = True
+            favorite["lane"] = "hold"
             favorite["stop_cents"] = ask
             favorite["stop_price_cents"] = None
+            favorite["conviction"] = _score(
+                (3.0, (abs(gap_bps) - hold_min_gap) / max(1.0, 3 * hold_min_gap)),
+                (2.0, (edge - hold_min_edge) / max(1.0, 2 * hold_min_edge)),
+                (2.0, (prob - hold_min_prob) / max(0.01, 1.0 - hold_min_prob)),
+                (1.0, 0.5 if efficiency is None else efficiency),
+            )
 
     # The price band and exit-liquidity gates protect round trips. A late
     # settlement snipe never exits -- it buys 90+c contracts on purpose --
@@ -580,6 +706,113 @@ def evaluate(trades, market, orderbook):
         )
 
     min_required_edge = max(cfg.min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
+
+    # ---- the dip lanes ---------------------------------------------------
+    # Evaluated before the momentum gates because those gates exist to refuse
+    # exactly this shape of trade. Everything protecting a round trip -- price
+    # band, exit liquidity, spread -- has already been enforced above and is
+    # NOT bypassed here; only the trend/RSI/support/chop reads are, and only
+    # because a dip buy is by definition against the immediate move.
+    dip = None
+    if (
+        cfg.dip_entry
+        and not late_window
+        and tape is not None
+        and chart is not None
+        and remaining >= cfg.dip_min_seconds_to_close
+    ):
+        drop = tape["drop_cents"]
+        decel_ok = bool(tape["decelerating"]) or not cfg.dip_require_decel
+        imbalance = tape["imbalance"]
+        imbalance_ok = imbalance is None or imbalance >= cfg.dip_min_imbalance
+        dip_edge_floor = max(cfg.dip_min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
+
+        # Exhaustion on the SPOT read, in the direction that would have pushed
+        # this side down. For a YES dip, spot sold off, so oversold RSI is the
+        # exhaustion that makes a bounce plausible.
+        exhausted = (
+            chart["rsi"] <= cfg.rsi_oversold
+            if side == "yes"
+            else chart["rsi"] >= cfg.rsi_overbought
+        )
+        # Did spot justify the drop? For a YES dip, spot falling is
+        # justification; for a NO dip, spot rising is.
+        spot_justifies = spot_bps is not None and (
+            spot_bps <= -cfg.dip_max_spot_move_bps
+            if side == "yes"
+            else spot_bps >= cfg.dip_max_spot_move_bps
+        )
+
+        dislocation = (
+            cfg.dip_dislocation
+            and drop >= cfg.dip_min_drop_cents
+            and edge >= dip_edge_floor
+            and decel_ok
+            and imbalance_ok
+            and spot_bps is not None
+            and not spot_justifies
+        )
+        reversion = (
+            cfg.dip_reversion
+            and drop >= cfg.dip_reversion_min_drop_cents
+            and edge >= dip_edge_floor
+            and decel_ok
+            and imbalance_ok
+            and exhausted
+        )
+
+        if dislocation or reversion:
+            kind = "dislocation" if dislocation else "reversion"
+            # Velocities can legitimately be None on a sparse tape (and will
+            # be, if DIP_REQUIRE_DECEL is off), so they are never formatted raw.
+            fast_text = "n/a" if tape["velocity_fast"] is None else f"{tape['velocity_fast']:+.2f}"
+            slow_text = "n/a" if tape["velocity_slow"] is None else f"{tape['velocity_slow']:+.2f}"
+            spot_text = "n/a" if spot_bps is None else f"{spot_bps:+.1f}"
+            imbalance_text = "n/a" if imbalance is None else f"{imbalance:+.2f}"
+            # Dip stops are widened: the tape that just moved 9c in seconds is
+            # not going to sit still while the recovery develops, and a normal
+            # stop would be taken out by the noise of the dip itself.
+            dip_stop = max(
+                cfg.stop_min_cents,
+                min(99, int(round(stop_cents * cfg.dip_stop_mult))),
+            )
+            conviction = _score(
+                # How far beyond the minimum the dip actually went. A 6c dip
+                # at a 6c threshold is a marginal setup; an 18c dip is not.
+                (3.0, (drop - cfg.dip_min_drop_cents) / max(1.0, 2 * cfg.dip_min_drop_cents)),
+                # Edge beyond the fee floor -- the part that is actually ours.
+                (3.0, (edge - dip_edge_floor) / max(1.0, 2 * dip_edge_floor)),
+                # Bid rebuilding underneath us.
+                (1.5, 0.5 if imbalance is None else (imbalance + 1) / 2),
+                # The fall has actually stopped, not just slowed.
+                (1.5, 1.0 if tape["decelerating"] else 0.0),
+                # Room for the recovery to happen.
+                (1.0, remaining / max(1.0, cfg.max_seconds_to_close)),
+                # A dislocation is a cleaner read than a fade, so the fade
+                # variant is scored down rather than sized like the real thing.
+                (1.0, 1.0 if dislocation else 0.35),
+            )
+            dip = {
+                "action": f"BUY {side.upper()}",
+                "confidence": confidence,
+                "reason": (
+                    f"Dip {kind}: {side.upper()} mid fell {drop:.1f}c from its "
+                    f"{tape['lookback_seconds']}s high while spot moved "
+                    f"{spot_text}bps, fall "
+                    f"{'decelerating' if tape['decelerating'] else 'still active'} "
+                    f"({fast_text}c/s vs {slow_text}c/s), "
+                    f"book imbalance {imbalance_text}, "
+                    f"fair {prob * 100:.1f}% vs {ask}c ask ({edge:.1f}c edge) -- "
+                    f"buying the recovery with a {dip_stop}c stop, conviction {conviction}"
+                ),
+            }
+            dip.update(diagnostics)
+            dip["lane"] = f"dip_{kind}"
+            dip["dip"] = True
+            dip["conviction"] = conviction
+            dip["stop_cents"] = dip_stop
+            dip["stop_price_cents"] = max(1, ask - dip_stop)
+            return dip
 
     if edge < min_required_edge:
         return favorite or _no_trade(
@@ -638,6 +871,11 @@ def evaluate(trades, market, orderbook):
             ),
         }
         payload.update(diagnostics)
+        payload["lane"] = "late"
+        payload["conviction"] = _score(
+            (3.0, (prob - cfg.late_min_fair_prob) / max(0.01, 1.0 - cfg.late_min_fair_prob)),
+            (2.0, (cfg.late_max_price_cents - ask) / max(1.0, cfg.late_max_price_cents - 50.0)),
+        )
         return payload
 
     wanted_trend = "up" if side == "yes" else "down"
@@ -707,9 +945,21 @@ def evaluate(trades, market, orderbook):
             f"Fair {prob * 100:.1f}% vs {ask}c ask - {edge:.1f}c edge "
             f"({fee_cents_per_contract:.1f}c fees included), "
             f"trend {chart['trend']} (RSI {chart['rsi']:.0f}), "
-            f"~{move:.1f}c expected travel, {stop_cents}c stop, scalping to "
-            f"{'/'.join(str(tier.cents) for tier in tiers)}c"
+            f"~{move:.1f}c expected travel, {stop_cents}c stop, "
+            f"{'riding behind a trailing stop' if cfg.exit_profile == 'runner' else 'scalping to ' + '/'.join(str(tier.cents) for tier in tiers) + 'c'}"
         ),
     }
     payload.update(diagnostics)
+    payload["lane"] = "trend"
+    payload["conviction"] = _score(
+        # Edge above the fee-adjusted floor: the part of the mispricing we keep.
+        (3.0, (edge - min_required_edge) / max(1.0, 2 * min_required_edge)),
+        # How directional the tape is. A momentum entry in a chopping tape is
+        # the losing pattern this filter exists for, so it is weighted heavily.
+        (2.5, 0.5 if efficiency is None else efficiency / max(0.01, 2 * cfg.min_efficiency_ratio)),
+        # Trend conviction, as EMA separation beyond the deadzone.
+        (1.5, (abs(chart["separation_bps"]) - cfg.trend_deadzone_bps) / max(1.0, 4 * cfg.trend_deadzone_bps)),
+        # Room to travel relative to the stop being risked.
+        (2.0, 0.5 if move is None else move / max(1.0, 2.0 * stop_cents)),
+    )
     return payload

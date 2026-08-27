@@ -1,14 +1,28 @@
-"""BTC 15-minute scalping dashboard and autonomous trader.
+"""BTC 15-minute dashboard and autonomous trader.
 
 The web process owns the market-data feeds; the trader loop runs beside them in
 the same event loop and reads the signal they produce. Everything the trader
 does is visible on /api/state.
+
+Three feeds run here, and the distinction between them matters:
+
+  - feeds.hub: several spot exchanges at once, merged into a median tape. Used
+    for the underlying read and for a divergence veto -- when the venues
+    disagree, one of them is broken, and neither the bot nor anyone else knows
+    which, so it stands down.
+  - kalshi_orderbook_ws_worker: the authenticated Kalshi L2 book, applied delta
+    by delta into an in-memory book. This is the ONLY feed an order is allowed
+    to block on, and the trader reads it directly out of this process instead
+    of re-fetching over REST.
+  - booktape: every published book snapshot, kept as a per-contract time series.
+    This is the contract's own chart -- the thing the strategy previously had no
+    access to, and the reason it could not see a dip in the contract price that
+    a human watching the screen sees instantly.
 """
 
 import asyncio
 import json
 import time
-from collections import deque
 from pathlib import Path
 
 import websockets
@@ -16,7 +30,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+import booktape
 import config
+import feeds
 import policy
 import risk
 import scalp
@@ -26,14 +42,14 @@ from kalshi_client import KalshiApiError, KalshiAuthError, KalshiClient
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-COINBASE_WS = "wss://advanced-trade-ws.coinbase.com"
-COINBASE_PRODUCT = "BTC-USD"
-
-trades = deque(maxlen=20000)
+# The spot tape is owned by feeds.hub, which runs several exchange sockets at
+# once and writes a consensus (median) print. A single-venue feed cannot tell a
+# real move from that venue's own glitch, and acting on a glitch is worse than
+# missing a move. `trades` is the same (timestamp, price) deque shape the rest
+# of this module already expects, so nothing downstream changes.
+trades = feeds.hub.trades
 
 state = {
-    "spot_connected": False,
-    "spot_error": None,
     "kalshi_status": "Starting market discovery",
     "kalshi_error": None,
     "market": None,
@@ -41,6 +57,7 @@ state = {
     "book_error": None,
     "book_updated_at": None,
     "book_source": None,
+    "book_published_at": None,
     "kalshi_checked_at": None,
 }
 
@@ -94,7 +111,12 @@ def pct_move(seconds_ago):
 # The trader takes two providers rather than one combined object, so the signal
 # and the market can each be read at the moment it is needed.
 def current_signal():
-    return policy.evaluate(list(trades), state["market"], state["orderbook"])
+    return policy.evaluate(
+        list(trades),
+        state["market"],
+        state["orderbook"],
+        spot_status=feeds.hub.status(),
+    )
 
 
 def current_market():
@@ -159,8 +181,12 @@ def api_payload():
         "btc_usd": trades[-1][1] if trades else None,
         "move_15s": pct_move(15),
         "move_60s": pct_move(60),
-        "spot_connected": state["spot_connected"],
-        "last_error": state["spot_error"],
+        "spot_connected": feeds.hub.status()["connected_any"],
+        "last_error": feeds.hub.status()["error"],
+        # Per-venue health and cross-venue disagreement. When the venues
+        # disagree beyond SPOT_DIVERGENCE_BPS the policy stops trading rather
+        # than pick a winner, so this is worth showing.
+        "spot_feeds": feeds.hub.status(),
         "kalshi": {
             "status": state["kalshi_status"],
             "error": state["kalshi_error"],
@@ -173,6 +199,9 @@ def api_payload():
             "book_error": state["book_error"],
             "book_updated_at": state["book_updated_at"],
             "book_source": state["book_source"],
+            # The contract's OWN recent price action -- the series the bot
+            # previously had no record of at all.
+            "tape": booktape.view(market.get("ticker")),
         },
         "trader": trader.snapshot(),
         "trade_log": public_trade_log(),
@@ -182,41 +211,6 @@ def api_payload():
 
 
 # ------------------------------------------------------------- feeds
-
-
-async def coinbase_worker():
-    while True:
-        try:
-            async with websockets.connect(
-                COINBASE_WS, ping_interval=20, ping_timeout=20
-            ) as websocket:
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "subscribe",
-                            "channel": "market_trades",
-                            "product_ids": [COINBASE_PRODUCT],
-                        }
-                    )
-                )
-
-                state["spot_connected"] = True
-                state["spot_error"] = None
-
-                async for raw_message in websocket:
-                    message = json.loads(raw_message)
-
-                    if message.get("channel") != "market_trades":
-                        continue
-
-                    for event in message.get("events", []):
-                        for trade in event.get("trades", []):
-                            trades.append((time.time(), float(trade["price"])))
-
-        except Exception as error:
-            state["spot_connected"] = False
-            state["spot_error"] = str(error)[:160]
-            await asyncio.sleep(3)
 
 
 def choose_market(markets):
@@ -265,6 +259,13 @@ async def kalshi_market_discovery_worker():
                 state["market"] = market
                 if market.get("ticker") != previous:
                     state["orderbook"] = None
+                    state["book_published_at"] = None
+                    # Drop the previous contract's tape. A new 15-minute
+                    # market is a new instrument; carrying the old one's
+                    # highs and lows across the roll would manufacture a
+                    # dip that never happened.
+                    if previous:
+                        booktape.forget(previous)
 
         except Exception as error:
             state["kalshi_status"] = "Market discovery error"
@@ -340,7 +341,22 @@ def _publish_local_book():
     }
     state["book_error"] = None
     state["book_updated_at"] = int(time.time())
+    # Sub-second precision, separately from the display timestamp above: the
+    # trader uses this to decide whether the in-memory book is fresh enough to
+    # trade on, and a 1-second-resolution integer cannot answer that.
+    state["book_published_at"] = time.time()
     state["book_source"] = "websocket"
+
+    # Record this snapshot on the contract's own tape. This is what lets the
+    # strategy see the dip in the CONTRACT rather than inferring it from BTC.
+    ticker = _local_book["ticker"]
+    if ticker:
+        # booktape wants the normalized top-of-book shape, not the raw levels.
+        booktape.record(ticker, policy.book_snapshot(state["orderbook"]))
+
+    # And wake the trading loop, so exits are evaluated on the delta that
+    # moved the price instead of on the next scheduled poll.
+    trader.notify_book()
 
 
 def _handle_ws_message(raw_message, ticker):
@@ -459,14 +475,34 @@ async def orderbook_rest_fallback_worker():
         await asyncio.sleep(config.settings.book_poll_seconds)
 
 
+def _live_book(ticker):
+    """The in-memory WebSocket book, for the trader's exit path.
+
+    Returns (book, published_at_epoch) or None. The trader calls this instead
+    of fetching the book over REST, which is the single largest latency win
+    available here: the book is already in this process, applied delta by
+    delta as Kalshi pushes it.
+    """
+    if not ticker or (state["market"] or {}).get("ticker") != ticker:
+        return None
+    book = state["orderbook"]
+    if not book:
+        return None
+    return book, state.get("book_published_at") or 0
+
+
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(coinbase_worker())
+    # One task per spot venue; the hub merges them into a consensus tape.
+    for task in feeds.hub.tasks():
+        asyncio.create_task(task)
+
     asyncio.create_task(kalshi_market_discovery_worker())
     asyncio.create_task(kalshi_orderbook_ws_worker())
     asyncio.create_task(orderbook_rest_fallback_worker())
 
     if config.settings.is_enabled:
+        trader.set_book_provider(_live_book)
         asyncio.create_task(trader.loop(client, current_signal, current_market))
 
 
@@ -517,7 +553,7 @@ async def api_stream():
 async def health():
     return {
         "ok": True,
-        "spot_connected": state["spot_connected"],
+        "spot_connected": feeds.hub.status()["connected_any"],
         "kalshi_status": state["kalshi_status"],
         "trading_mode": config.settings.trading_mode,
         "trader_running": trader.status.get("running"),
