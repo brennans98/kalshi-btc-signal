@@ -219,6 +219,13 @@
         <div class="label">Session P&amp;L <span id="pnl-mode"></span></div>
         <div class="value" id="pnl">—</div>
         <div class="sub" id="pnl-detail">—</div>
+        <div class="sub" id="pnl-fees">—</div>
+      </div>
+
+      <div class="card wide">
+        <div class="label">System Health</div>
+        <div class="value" id="health">—</div>
+        <div class="sub" id="health-detail">—</div>
       </div>
 
       <div class="card wide">
@@ -312,6 +319,13 @@
       return (dollars >= 0 ? "+" : "-") + "$" + Math.abs(dollars).toFixed(2);
     }
 
+    // Fees and other costs are always a subtraction, so a signed format reads
+    // wrong on them: "fees +$3.84" looks like income.
+    function formatCost(value) {
+      if (value === null || value === undefined) return "—";
+      return "$" + Math.abs(value / 100).toFixed(2);
+    }
+
     function formatTime(iso) {
       if (!iso) return "—";
       var parsed = new Date(iso);
@@ -377,6 +391,78 @@
         detail += " - HALTED: " + (trader.halt_reason || "manual");
       }
       text("pnl-detail", detail);
+
+      // The fee line is the point of the whole accuracy pass. Net is the
+      // headline above; this shows what the gross looked like and what trading
+      // cost, because a healthy gross with a negative net means the strategy is
+      // trading too often for the edge it has.
+      var gross = stats.realized_gross_cents;
+      var fees = stats.fees_cents;
+      if (gross === undefined || fees === undefined) {
+        text("pnl-fees", "Net of fees");
+      } else {
+        var feeLine = "Gross " + formatCents(gross) + " less " + formatCost(fees) +
+          " fees = net " + formatCents(realized || 0);
+        if (fees > 0 && gross > 0) {
+          feeLine += " - fees took " + Math.round((fees / gross) * 100) + "% of gross";
+        } else if (fees > 0 && gross <= 0) {
+          // Losing before costs. Worth saying plainly rather than implying a ratio.
+          feeLine += " - losing before fees";
+        }
+        text("pnl-fees", feeLine);
+      }
+    }
+
+    function renderHealth(trader) {
+      trader = trader || {};
+      var storage = trader.storage || {};
+      var clock = trader.clock || {};
+      var problems = [];
+
+      // Storage first: if state is not reaching disk, a restart forgets open
+      // positions and any latched halt.
+      if (storage.healthy === false) {
+        problems.push("STORAGE FAILING");
+      }
+      if (storage.recovered_from_corruption) {
+        problems.push("recovered a corrupt state file");
+      }
+      if (clock.severe) {
+        problems.push("CLOCK OUT OF SYNC");
+      } else if (clock.drifting) {
+        problems.push("clock drifting " + clock.skew_seconds + "s");
+      }
+      if (trader.halted) {
+        problems.push("halted");
+      }
+
+      var element = document.getElementById("health");
+      if (problems.length) {
+        element.textContent = problems.join(" - ");
+        element.className = "value loss";
+      } else {
+        element.textContent = "OK";
+        element.className = "value gain";
+      }
+
+      var detail = "Mode " + (trader.mode || "?");
+      detail += " - storage " + (storage.healthy === false ? "FAILING" : "ok");
+      if (storage.pending_writes) {
+        detail += " (" + storage.pending_writes + " pending)";
+      }
+      detail += " - clock ";
+      if (clock.skew_seconds === null || clock.skew_seconds === undefined) {
+        detail += "not yet measured";
+      } else {
+        detail += clock.skew_seconds + "s vs exchange";
+        if (!clock.trusted) {
+          detail += " (settling)";
+        }
+      }
+      if (clock.rtt_seconds) {
+        detail += " - rtt " + Math.round(clock.rtt_seconds * 1000) + "ms";
+      }
+      text("health-detail", detail);
     }
 
     function renderLadder(trader) {
@@ -465,6 +551,7 @@
       text("market-title", kalshi.market_title || kalshi.status || "—");
 
       renderPnl(data.trader);
+      renderHealth(data.trader);
       renderLadder(data.trader);
       renderMoves(data);
       renderLog(data.trade_log);
