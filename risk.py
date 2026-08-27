@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 
 import config
+import store
 
 
 def limits():
@@ -73,10 +74,7 @@ def _blank_state():
 
 
 def load_state():
-    try:
-        state = json.loads(config.settings.risk_state_path.read_text())
-    except Exception:
-        state = _blank_state()
+    state = store.read(config.settings.risk_state_path, _blank_state)
 
     if state.get("day") != _today():
         manual = state.get("halted") and state.get("halt_is_manual")
@@ -93,12 +91,15 @@ def load_state():
 
 
 def save_state(state):
-    try:
-        path = config.settings.risk_state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    """Persist risk state atomically.
+
+    This file holds the halt latch. The previous version truncated the file
+    before writing it and swallowed every failure, so a process killed mid-write
+    left an unparseable file -- and the reader treated that as "no halt". A
+    breached daily loss limit could therefore un-latch itself across a crash or
+    redeploy, which defeats the entire purpose of latching it to disk.
+    """
+    store.write(config.settings.risk_state_path, state)
 
 
 def log_decision(record):

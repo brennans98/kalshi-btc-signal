@@ -42,6 +42,7 @@ import config
 import policy
 import risk
 import scalp
+import store
 from kalshi_client import KalshiApiError, KalshiAuthError
 
 status = {
@@ -134,6 +135,10 @@ def snapshot():
     payload["day_start_balance_cents"] = state.get("day_start_balance_cents")
     payload["drawdown_cents"] = risk.drawdown_cents(_equity_cents(), state=state)
     payload["scalp"] = scalp.view(active if active != "off" else "dryrun")
+    # Persistence health. If this is unhealthy, state is not reaching disk and a
+    # restart will forget open positions and any latched halt -- which matters
+    # more than anything else on this payload.
+    payload["storage"] = store.status()
     return payload
 
 
@@ -1303,6 +1308,11 @@ async def tick(client, signal_provider, market_provider):
 
     await run_entry(client, signal, market_provider())
 
+    # Commit anything the tick deferred. Last, so it is never in front of an
+    # exit decision, and unconditional, so a quiet market cannot leave the most
+    # recent mark unwritten indefinitely.
+    store.flush(max_delay=1.0)
+
 
 async def loop(client, signal_provider, market_provider):
     """Run until the process stops. Errors are logged, not fatal."""
@@ -1355,9 +1365,18 @@ async def loop(client, signal_provider, market_provider):
         # it is quiet. This is the difference between reacting to a dip on the
         # delta that created it and finding out about it up to two seconds
         # later -- the entire point of being co-located.
+        #
+        # The floor first: on a fast tape the wake event is set again before the
+        # tick finishes, so without it the loop never yields at all.
+        floor = config.settings.loop_min_seconds
+        if floor > 0:
+            await asyncio.sleep(floor)
+
         event = book_event()
         try:
-            await asyncio.wait_for(event.wait(), timeout=config.settings.loop_seconds)
+            timeout = max(0.0, config.settings.loop_seconds - floor)
+            if timeout > 0:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
         finally:

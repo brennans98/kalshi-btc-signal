@@ -42,6 +42,7 @@ import math
 import time
 
 import config
+import store
 
 
 def _blank_tier_hits():
@@ -72,10 +73,15 @@ def _path(mode):
 
 
 def load(mode):
-    try:
-        state = json.loads(_path(mode).read_text())
-    except Exception:
-        return _blank()
+    """Current lot state. Served from memory; see store.py for why.
+
+    Note this returns the LIVE cached object, not a copy: callers mutate it and
+    then call save(). That is deliberate -- copying the whole lot book on every
+    read of a sub-second loop is exactly the kind of overhead this change was
+    made to remove -- but it means a caller must not mutate state it does not
+    intend to persist.
+    """
+    state = store.read(_path(mode), _blank)
 
     blank = _blank()
     state.setdefault("lots", {})
@@ -89,13 +95,22 @@ def load(mode):
     return state
 
 
+def save_lazy(mode, state):
+    """Update lot state in memory and let store coalesce the disk write.
+
+    Only for per-tick bookkeeping. Entries, exits and settlements use save().
+    """
+    store.write_lazy(_path(mode), state, max_delay=1.0)
+
+
 def save(mode, state):
-    try:
-        path = _path(mode)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    """Persist lot state atomically.
+
+    A failure here is NOT swallowed. Losing the lot book means losing the entry
+    basis of live positions, so the trader needs to know rather than find out
+    at the next restart.
+    """
+    store.write(_path(mode), state)
 
 
 def key(ticker, side):
@@ -276,7 +291,19 @@ def record_entry(
 
 
 def mark(mode, lot_key, bid):
-    """Record the current bid and high-water gain. Called before plan()."""
+    """Record the current bid and high-water gain. Called before plan().
+
+    This runs on every tick of every open lot, which on an event-driven loop is
+    many times a second. It therefore persists LAZILY: the in-memory state is
+    updated immediately (so the trail and stop always read the true peak), but
+    the disk write is coalesced. Synchronously fsyncing the lot book several
+    times a second from inside the exit path would put filesystem latency in
+    front of every stop evaluation -- the exact opposite of the point.
+
+    The fields written here are also the cheapest ones to lose: after a crash,
+    reconcile() re-adopts the real position from the exchange, and the peak
+    rebuilds from the live book within a tick.
+    """
     state = load(mode)
     lot = (state.get("lots") or {}).get(lot_key)
     if not lot:
@@ -286,7 +313,7 @@ def mark(mode, lot_key, bid):
     lot["last_bid"] = bid
     lot["peak_gain"] = max(lot.get("peak_gain", 0), gain)
     lot["marked_at"] = time.time()
-    save(mode, state)
+    save_lazy(mode, state)
 
     lot = dict(lot)
     lot["key"] = lot_key

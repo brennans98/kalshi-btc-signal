@@ -194,3 +194,86 @@ Specifically:
 - **The market makers on KXBTC15M are pricing these contracts efficiently and
   are also co-located.** The realistic goal is a small, real edge in specific
   conditions, not a structural advantage over everyone.
+
+## Hardening pass: the failure modes that lose money by breaking
+
+The rework above changes what the bot decides. This pass changes what happens
+when the process dies at the worst possible moment. These are a different class
+of defect: not "wrong about the market" but "broken", and they were all silent.
+
+### 1. State writes were not atomic (`store.py`)
+
+`path.write_text(json.dumps(...))` truncates the file, then writes it. A process
+killed between those two steps — a redeploy, an OOM kill, a host restart — leaves
+a half-written file. The reader caught the parse error and returned blank state.
+
+So the real behaviour was:
+
+- **`scalp.py`**: open positions silently forgotten. The lot book holds the entry
+  basis and the running peak; without it the bot no longer knows it has a
+  position, or what it paid.
+- **`risk.py`**: **a latched halt silently cleared.** The daily loss limit writes
+  `halted: true` to disk specifically so it survives a restart. A torn write made
+  the reader see "no halt" and resume trading. A halt that clears itself on a
+  crash is not a safety mechanism.
+
+Now: write to a temp file in the same directory, `fsync`, then `os.replace`,
+which is atomic on POSIX — a reader sees either the complete old file or the
+complete new one, never a partial. The last committed state is also kept as a
+`.bak`, written *after* the primary succeeds so it always holds the last good
+revision rather than trailing one behind.
+
+### 2. Write failures were swallowed
+
+Both save paths ended in `except Exception: pass`. A full disk or a read-only
+volume discarded every subsequent write while the bot traded on as though it had
+saved — and would only find out at the next restart, having forgotten everything
+since the first failure. Writes now raise, and `/api/state` carries
+`trader.storage` with `healthy`, any active `errors`, and a sticky
+`recovered_from_corruption` flag. If that flag is set, the process was killed
+mid-write at some point; the state was recovered, but you should know it happened.
+
+### 3. Disk I/O sat in the hot exit path
+
+Every `load()` read and parsed JSON from disk, and `mark()` — which runs for
+every open lot on every tick — wrote it back. That was tolerable on a 2-second
+loop. On the new event-driven sub-second loop it put filesystem latency directly
+in front of every stop and trail evaluation, which is precisely the path the
+co-location is for.
+
+Now state is cached in memory and written through. Reads never touch the disk.
+Per-tick mark updates use `store.write_lazy()`: memory updates immediately, so
+the trail always reads the true peak, while the disk write is coalesced to at
+most once a second and flushed at the *end* of the tick, never in front of an
+exit. Entries, exits and halts still write synchronously and durably — those are
+the events you cannot reconstruct.
+
+### 4. The event loop could spin
+
+`await asyncio.wait_for(event.wait(), ...)` followed by `event.clear()` returns
+immediately if the book updated while the tick was still running — which on a
+fast tape is most of the time. The loop would never yield: one core pinned, and
+scheduling jitter added to the exit path. `TRADE_LOOP_MIN_SECONDS` (default
+0.02) is now awaited before the wait. 20ms is far below any timescale the
+strategy reasons about and it bounds the spin.
+
+### 5. Dangerous-but-legal configurations are now surfaced
+
+`config.settings.cautions()` reports combinations that are valid — so they must
+not block startup — but interact in ways that are easy to set by accident and
+expensive to discover live. They appear as `config_cautions` in `/api/state`.
+
+**One fires on the current defaults, and it is a direct consequence of raising
+position size:** `MAX_COST_PER_TRADE_CENTS` is now 2000 ($20) while
+`DAILY_LOSS_LIMIT_CENTS` is also 2000 ($20). One full-size losing position can
+therefore consume the entire daily budget and latch the halt for the rest of the
+day. That may be what you want. If it is not, raise `DAILY_LOSS_LIMIT_CENTS` to
+roughly 2–3× max position size. **This default was deliberately left alone —
+raising someone's loss limit is not a decision code should make quietly.**
+
+### What this still does not fix
+
+Nothing here makes the strategy more likely to be right. It removes ways for the
+bot to lose money by malfunctioning rather than by being wrong. The market
+exposure is unchanged, and no amount of this work makes a position on a binary
+market safe.

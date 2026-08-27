@@ -420,6 +420,15 @@ class Settings:
     # could not see a dip that completes in four seconds; that was the single
     # largest cause of missed entries and late exits.
     loop_seconds: float = field(default_factory=lambda: _float("TRADE_LOOP_SECONDS", 0.25))
+    # Minimum gap between ticks, regardless of how fast the book is updating.
+    # An event-driven loop with no floor spins as fast as the busiest market
+    # will let it: on a fast tape the wake event is already set again before the
+    # tick finishes, so the loop never sleeps, burns a core, and adds scheduling
+    # jitter to the exit path it was supposed to speed up. 20ms is far below
+    # any timescale the strategy reasons about and still bounds the spin.
+    loop_min_seconds: float = field(
+        default_factory=lambda: _float("TRADE_LOOP_MIN_SECONDS", 0.02)
+    )
     # Order-status polling is the one thing in the loop that costs API calls,
     # so it keeps its own floor independent of the loop cadence.
     pending_poll_seconds: float = field(default_factory=lambda: _float("PENDING_POLL_SECONDS", 0.5))
@@ -655,6 +664,13 @@ class Settings:
         # ---- loop ----
         if self.loop_seconds <= 0:
             issues.append("TRADE_LOOP_SECONDS must be positive")
+        if self.loop_min_seconds < 0:
+            issues.append("TRADE_LOOP_MIN_SECONDS cannot be negative")
+        if self.loop_min_seconds > self.loop_seconds:
+            issues.append(
+                "TRADE_LOOP_MIN_SECONDS must be <= TRADE_LOOP_SECONDS, or the "
+                "floor would outlast the heartbeat it is meant to bound"
+            )
         if self.pending_poll_seconds < self.loop_seconds:
             issues.append(
                 "PENDING_POLL_SECONDS must be >= TRADE_LOOP_SECONDS, or order-status "
@@ -664,6 +680,76 @@ class Settings:
             issues.append("BOOK_MAX_AGE_SECONDS must be positive")
 
         return issues
+
+    def cautions(self) -> list[str]:
+        """Settings that are legal but dangerous together.
+
+        Distinct from problems(): none of these is wrong, so none of them should
+        stop the bot from starting. They are combinations where the numbers
+        interact in a way that is easy to set by accident and expensive to
+        discover live. Surfaced on the dashboard so the choice is deliberate
+        rather than implicit.
+        """
+        notes = []
+
+        # After raising per-trade size, a single full-size losing position can
+        # consume the entire day's loss budget and latch the halt. That may be
+        # intended -- one strike and stop -- but it should not be a surprise.
+        # The runtime limit can only be lower than this (risk.py also caps it at
+        # a percentage of the day's opening balance), so comparing against the
+        # absolute cap is the conservative check.
+        effective_daily = self.daily_loss_limit_cents
+        if effective_daily and self.max_cost_per_trade_cents >= effective_daily:
+            notes.append(
+                f"One full-size position (${self.max_cost_per_trade_cents / 100:.2f}) "
+                f"can lose the entire daily budget (${effective_daily / 100:.2f}), so a "
+                f"single bad trade can halt the day. Raise DAILY_LOSS_LIMIT_CENTS "
+                f"to roughly 2-3x max position size if you want room to be wrong "
+                f"more than once."
+            )
+
+        # Conviction sizing has no range to work with if the bounds coincide.
+        if self.conviction_sizing and self.min_cost_per_trade_cents >= self.max_cost_per_trade_cents:
+            notes.append(
+                "CONVICTION_SIZING is on but MIN_COST_PER_TRADE_CENTS equals "
+                "MAX_COST_PER_TRADE_CENTS, so every trade is the same size and "
+                "conviction has no effect on sizing."
+            )
+
+        # The dip lane needs the contract tape to have something in it.
+        if self.dip_entry and self.tape_seconds < self.dip_lookback_seconds:
+            notes.append(
+                "TAPE_SECONDS is shorter than DIP_LOOKBACK_SECONDS, so the dip "
+                "lane will never see a full lookback window."
+            )
+
+        # A trail that cannot tighten below the arm threshold never protects
+        # anything: the stop would sit above the point at which it armed.
+        if self.exit_profile == "runner" and self.runner_trail_min_cents >= max(
+            self.runner_arm_cents, 1
+        ) * 3:
+            notes.append(
+                f"RUNNER_TRAIL_MIN_CENTS ({self.runner_trail_min_cents}) is wide "
+                f"relative to RUNNER_ARM_CENTS ({self.runner_arm_cents}): the trail "
+                f"arms early but sits far behind price, so small winners will give "
+                f"most of the gain back before the trail triggers."
+            )
+
+        # Riding to settlement while the guard would force an exit first.
+        if self.settle_ride and self.max_hold_seconds < self.settlement_guard_seconds:
+            notes.append(
+                "SCALP_MAX_HOLD_SECONDS is shorter than SETTLEMENT_GUARD, so the "
+                "max-hold exit fires before a settlement ride can ever happen."
+            )
+
+        # Live trading with a size the user has not walked up to.
+        if self.trading_mode == "live" and self.kalshi_env == "demo":
+            notes.append(
+                "TRADING_MODE is live but KALSHI_ENV is demo: orders go to the "
+                "demo exchange, not the real one."
+            )
+
+        return notes
 
     def public_view(self) -> dict:
         """Non-secret settings, safe to expose on /api/state."""
@@ -752,12 +838,14 @@ class Settings:
             "conviction_sizing": bool(self.conviction_sizing),
             "min_cost_per_trade_cents": self.min_cost_per_trade_cents,
             "loop_seconds": self.loop_seconds,
+            "loop_min_seconds": self.loop_min_seconds,
             "book_max_age_seconds": self.book_max_age_seconds,
             "maker_improve_cents": self.maker_improve_cents,
             "entry_rest_seconds": self.entry_rest_seconds,
             "maker_fee_multiplier": self.maker_fee_multiplier,
             "credentials_present": bool(self.key_id and self.private_key_pem),
             "config_problems": self.problems(),
+            "config_cautions": self.cautions(),
         }
 
 
