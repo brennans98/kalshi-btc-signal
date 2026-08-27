@@ -62,7 +62,7 @@ one engine covers both the $5 marginal setup and the $20 fully-confirmed one.
 import math
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import booktape
 import config
@@ -212,6 +212,17 @@ def market_strike(market):
 
 
 def close_epoch(market):
+    """Unix epoch of the market close, or None.
+
+    The timezone handling here is not cosmetic. datetime.timestamp() on a NAIVE
+    datetime interprets it as LOCAL time, so if Kalshi ever returns a timestamp
+    without an offset, the close would land hours away from the truth -- and
+    seconds_to_close feeds the settlement guard, the late-entry window, and every
+    "is there time to exit" decision. Being wrong by one timezone here means
+    holding positions straight through expiry. Kalshi sends RFC3339 with a Z, so
+    this should never trigger; it is explicit because the failure is silent and
+    total rather than noisy and partial.
+    """
     close_time = (market or {}).get("close_time")
     if not close_time:
         return None
@@ -221,12 +232,25 @@ def close_epoch(market):
     except (ValueError, AttributeError):
         return None
 
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
     return parsed.timestamp()
 
 
-def seconds_to_close(market):
+def seconds_to_close(market, skew_seconds=0.0):
+    """Seconds until close, optionally adjusted for measured clock skew.
+
+    skew_seconds is how far our clock is AHEAD of the exchange's matching
+    engine. A clock running behind the exchange makes us believe there is more
+    time left than there is, which is the dangerous direction: it delays the
+    settlement guard and can leave a position unexited at expiry. Subtracting a
+    negative skew shortens the remaining time, so the guard fires earlier.
+    """
     epoch = close_epoch(market)
-    return None if epoch is None else epoch - time.time()
+    if epoch is None:
+        return None
+    return epoch - time.time() + min(0.0, float(skew_seconds or 0.0))
 
 
 def taker_fee_cents(count, price_cents):
@@ -317,10 +341,14 @@ def book_snapshot(orderbook):
     normalised = _normalize_orderbook_fp(orderbook)
     book = (normalised or {}).get("orderbook") or {}
 
-    def top(levels):
-        best_price = None
-        best_size = 0
+    def ladder(levels):
+        """Clean, sorted bid ladder: [(price, size), ...] best price first.
 
+        Keeping the whole ladder rather than only the top matters because
+        orders are sized in contracts, and how many contracts exist at a price
+        is not the same question as what the price is.
+        """
+        cleaned = {}
         for level in levels or []:
             if not isinstance(level, (list, tuple)) or len(level) < 2:
                 continue
@@ -328,13 +356,16 @@ def book_snapshot(orderbook):
                 price, size = int(level[0]), int(level[1])
             except (TypeError, ValueError):
                 continue
-            if size > 0 and (best_price is None or price > best_price):
-                best_price, best_size = price, size
+            if size > 0 and 0 < price < 100:
+                # Duplicate prices are summed rather than overwritten.
+                cleaned[price] = cleaned.get(price, 0) + size
+        return sorted(cleaned.items(), key=lambda item: -item[0])
 
-        return best_price, best_size
+    yes_bids = ladder(book.get("yes"))
+    no_bids = ladder(book.get("no"))
 
-    yes_bid, yes_bid_size = top(book.get("yes"))
-    no_bid, no_bid_size = top(book.get("no"))
+    yes_bid, yes_bid_size = yes_bids[0] if yes_bids else (None, 0)
+    no_bid, no_bid_size = no_bids[0] if no_bids else (None, 0)
 
     return {
         "yes_bid": yes_bid,
@@ -344,7 +375,101 @@ def book_snapshot(orderbook):
         "yes_ask": None if no_bid is None else 100 - no_bid,
         "no_ask": None if yes_bid is None else 100 - yes_bid,
         "yes_spread": None if (yes_bid is None or no_bid is None) else (100 - no_bid) - yes_bid,
+        # Bid ladders, best first.
+        "yes_bids": yes_bids,
+        "no_bids": no_bids,
+        # Ask ladders, cheapest first. Buying YES means taking the NO bids:
+        # a NO bid of q cents for s contracts IS a YES offer at (100 - q) for
+        # s contracts. Same book, mirrored.
+        # No reversal: the bid ladders are sorted best-first, meaning highest
+        # price first, and 100 minus a descending sequence is already ascending.
+        # Reversing as well flips them to worst-first, which would silently
+        # price every sweep at the most expensive level on the book.
+        "yes_asks": [(100 - price, size) for price, size in no_bids],
+        "no_asks": [(100 - price, size) for price, size in yes_bids],
     }
+
+
+def asks_for_side(snapshot, side):
+    """The ladder we must lift to BUY `side`, cheapest first."""
+    return (snapshot or {}).get("yes_asks" if side == "yes" else "no_asks") or []
+
+
+def bids_for_side(snapshot, side):
+    """The ladder we must hit to SELL `side`, best first."""
+    return (snapshot or {}).get("yes_bids" if side == "yes" else "no_bids") or []
+
+
+def sweep(levels, count):
+    """Walk a ladder for `count` contracts and report what it would actually cost.
+
+    This exists because the bot was pricing every order at the top of book
+    while sending it as fill-or-kill for a size the top of book could not
+    supply. Two separate errors came out of that: orders that were killed
+    outright (the whole requested size had to exist at one price), and, if the
+    limit were widened, an average fill price worse than the edge calculation
+    assumed. Both are answered by walking the ladder before sending anything.
+
+    Fees are accumulated PER LEVEL, because Kalshi rounds its fee up to the
+    next cent on each fill. One fill of 60 and three fills of 20 do not cost
+    the same, and the single-ceiling estimate was always the optimistic one.
+
+    Returns filled (may be < count when the book is too thin), cost_cents,
+    avg_price_cents (float; the number the edge must actually clear),
+    worst_price_cents (the limit price required for the order to complete),
+    and fee_cents.
+    """
+    if count <= 0:
+        return {
+            "filled": 0,
+            "cost_cents": 0,
+            "avg_price_cents": None,
+            "worst_price_cents": None,
+            "fee_cents": 0.0,
+        }
+
+    filled = 0
+    cost = 0
+    fee = 0.0
+    worst = None
+
+    for price, size in levels or []:
+        if filled >= count:
+            break
+        take = min(int(size), count - filled)
+        if take <= 0:
+            continue
+        filled += take
+        cost += take * int(price)
+        fee += taker_fee_cents(take, price)
+        worst = int(price)
+
+    return {
+        "filled": filled,
+        "cost_cents": cost,
+        "avg_price_cents": None if filled == 0 else cost / filled,
+        "worst_price_cents": worst,
+        "fee_cents": fee,
+    }
+
+
+def depth_within(levels, max_slippage_cents):
+    """Contracts available without paying more than `max_slippage_cents` worse
+    than the best price on the ladder.
+
+    The cap is what keeps "size it to the book" from turning into "sweep the
+    book". Depth three cents up is depth we do not want.
+    """
+    levels = levels or []
+    if not levels:
+        return 0
+    best = int(levels[0][0])
+    total = 0
+    for price, size in levels:
+        if abs(int(price) - best) > max_slippage_cents:
+            break
+        total += int(size)
+    return total
 
 
 def spot_move_bps(trades, seconds):
@@ -394,14 +519,31 @@ def bid_for_side(snapshot, side):
     return (snapshot or {}).get("yes_bid" if side == "yes" else "no_bid")
 
 
-def evaluate(trades, market, orderbook, spot_status=None):
+def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'.
 
     spot_status is feeds.SpotHub.status(): the per-venue health of the
     consolidated spot tape. Passed in rather than imported so this stays a
     pure function of its inputs and remains testable with synthetic data.
+
+    clock_status is KalshiClient.clock_status(): our measured offset from the
+    exchange's clock. Every time-to-close decision is made on the local clock
+    but the market expires on theirs, so a drifting clock is treated as a
+    trading fault rather than absorbed silently.
     """
     cfg = config.settings
+
+    # Checked before anything else because a wrong clock corrupts every other
+    # check that follows: feed age, time-to-close, and hold duration are all
+    # differences against the local clock. A test caught this reporting "feed is
+    # stale" when the real fault was a clock minutes out of sync -- an accurate
+    # veto for a misleading reason is still a debugging trap.
+    clock = clock_status or {}
+    if clock.get("severe"):
+        return _no_trade(
+            "Local clock is out of sync with the exchange by "
+            f"{clock.get('skew_seconds')}s -- refusing to trade on unreliable timing"
+        )
 
     if not trades:
         return _no_trade("Waiting for live BTC-USD trades")
@@ -443,7 +585,7 @@ def evaluate(trades, market, orderbook, spot_status=None):
     if strike is None:
         return _no_trade(f"Cannot resolve strike for {market.get('ticker')}")
 
-    remaining = seconds_to_close(market)
+    remaining = seconds_to_close(market, clock.get("guard_adjustment_seconds") or 0.0)
     if remaining is None:
         return _no_trade("Market close time is unavailable")
 
@@ -500,7 +642,15 @@ def evaluate(trades, market, orderbook, spot_status=None):
         side, ask, edge, prob = "no", no_ask, no_edge, 1 - fair_yes
 
     exit_bid = bid_for_side(snapshot, side)
-    exit_size = snapshot["yes_bid_size" if side == "yes" else "no_bid_size"]
+    entry_levels = asks_for_side(snapshot, side)
+    exit_levels = bids_for_side(snapshot, side)
+
+    # Exit liquidity, measured as depth we could actually get out through
+    # rather than only the size resting at the very top of the bid. Sizing off
+    # top-of-book alone understates a deep book and overstates a book whose
+    # best bid is one lot in front of nothing.
+    exit_size = depth_within(exit_levels, cfg.exit_depth_slippage_cents)
+    exit_top_size = snapshot["yes_bid_size" if side == "yes" else "no_bid_size"]
     horizon = min(cfg.max_hold_seconds, max(0.0, remaining - cfg.settlement_guard_seconds))
     move = expected_move_cents(z, horizon, remaining)
     tiers = cfg.tiers()
@@ -542,6 +692,11 @@ def evaluate(trades, market, orderbook, spot_status=None):
     )
     fee_cents_per_contract = fee_cents_total / count_estimate
 
+    # The bar this trade's edge must clear, published on the signal so the
+    # sizing gate can re-check it against the AVERAGE fill price rather than
+    # the top-of-book price the edge was originally measured at.
+    min_required_edge = max(cfg.min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
+
     # The price a maker entry would rest at: join our side's bid, improved by
     # up to maker_improve_cents for queue priority, but never locking or
     # crossing the book (post-only would reject that anyway).
@@ -555,6 +710,13 @@ def evaluate(trades, market, orderbook, spot_status=None):
         "price_cents": ask,
         "exit_bid_cents": exit_bid,
         "exit_bid_size": exit_size,
+        "exit_bid_top_size": exit_top_size,
+        # The ladders themselves, so sizing can walk them instead of assuming
+        # the whole order fills at the best price.
+        "entry_levels": [[int(price), int(size)] for price, size in entry_levels],
+        "entry_depth_at_best": depth_within(entry_levels, 0),
+        "entry_depth": depth_within(entry_levels, cfg.max_entry_slippage_cents),
+        "min_required_edge_cents": round(min_required_edge, 3),
         "spread_cents": spread,
         "edge_cents": round(edge, 2),
         "fair_prob": round(prob, 4),
@@ -564,6 +726,7 @@ def evaluate(trades, market, orderbook, spot_status=None):
         "gap_bps": None if gap_bps is None else round(gap_bps, 1),
         "sigma_per_second": round(sigma, 8),
         "seconds_to_close": int(remaining),
+        "clock_skew_seconds": clock.get("skew_seconds"),
         "expected_move_cents": None if move is None else round(move, 2),
         "fee_cents_per_contract": round(fee_cents_per_contract, 2),
         "efficiency_ratio": None if efficiency is None else round(efficiency, 3),
@@ -705,7 +868,8 @@ def evaluate(trades, market, orderbook, spot_status=None):
             **diagnostics,
         )
 
-    min_required_edge = max(cfg.min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
+    # (min_required_edge was computed above, before diagnostics, so the signal
+    # can carry it to the sizing gate.)
 
     # ---- the dip lanes ---------------------------------------------------
     # Evaluated before the momentum gates because those gates exist to refuse

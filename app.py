@@ -116,6 +116,7 @@ def current_signal():
         state["market"],
         state["orderbook"],
         spot_status=feeds.hub.status(),
+        clock_status=client.clock_status(),
     )
 
 
@@ -203,7 +204,7 @@ def api_payload():
             # previously had no record of at all.
             "tape": booktape.view(market.get("ticker")),
         },
-        "trader": trader.snapshot(),
+        "trader": trader.snapshot(client),
         "trade_log": public_trade_log(),
         "config": config.settings.public_view(),
         "updated_at": int(time.time()),

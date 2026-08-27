@@ -267,6 +267,27 @@ class Settings:
     # count. At a 40c ask a $20 position is 50 contracts, so a 6-contract cap
     # silently turned every "$20" trade into a $2.40 one. This stays as a
     # backstop against a fat-fingered cost cap at a 1c ask, nothing more.
+    # ---- depth-aware execution -------------------------------------------
+    # Entries are fill-or-kill, so the ENTIRE requested size must be available
+    # at or inside the limit price or the order is killed and nothing happens.
+    # Sizing from the budget alone ("$20 / 45c = 44 contracts") ignores whether
+    # 44 contracts exist there. They usually do not on a 15-minute market, so
+    # the order was killed, logged as unfilled, and the bot moved on believing
+    # it had tried. With depth-aware sizing the order asks for what the book
+    # can actually supply.
+    depth_aware_sizing: int = field(default_factory=lambda: _int("DEPTH_AWARE_SIZING", 1))
+    # How far up the ask ladder an entry may reach. Depth three cents above the
+    # best offer is depth we do not want: it is what turns "size to the book"
+    # into "sweep the book" and hands the edge back as slippage.
+    max_entry_slippage_cents: int = field(
+        default_factory=lambda: _int("MAX_ENTRY_SLIPPAGE_CENTS", 2)
+    )
+    # The same question for the exit: how deep into the bid ladder we are
+    # willing to count as liquidity we can actually get out through. Wider than
+    # the entry cap, because being unable to exit is worse than paying to.
+    exit_depth_slippage_cents: int = field(
+        default_factory=lambda: _int("EXIT_DEPTH_SLIPPAGE_CENTS", 3)
+    )
     max_contracts_per_trade: int = field(default_factory=lambda: _int("MAX_CONTRACTS_PER_TRADE", 60))
     max_cost_per_trade_cents: int = field(
         default_factory=lambda: _int("MAX_COST_PER_TRADE_CENTS", 2000)
@@ -282,7 +303,12 @@ class Settings:
     min_cost_per_trade_cents: int = field(
         default_factory=lambda: _int("MIN_COST_PER_TRADE_CENTS", 500)
     )
-    daily_loss_limit_cents: int = field(default_factory=lambda: _int("DAILY_LOSS_LIMIT_CENTS", 2000))
+    # $50. Deliberately 2.5x max position size ($20): a single full-size loss
+    # must not be able to halt the whole day, or the halt stops being a
+    # circuit breaker and becomes a one-strike rule. Still capped in practice
+    # by DAILY_LOSS_LIMIT_PCT of the day's opening balance (see risk.py), so a
+    # small account is protected by the percentage, not this number.
+    daily_loss_limit_cents: int = field(default_factory=lambda: _int("DAILY_LOSS_LIMIT_CENTS", 5000))
     # The absolute daily loss limit above is meaningless when it exceeds the
     # account balance. The effective limit is the SMALLER of the absolute cap
     # and this percentage of the day's opening balance, so a small account is
@@ -661,6 +687,17 @@ class Settings:
         if self.min_cost_per_trade_cents > self.max_cost_per_trade_cents:
             issues.append("MIN_COST_PER_TRADE_CENTS must be <= MAX_COST_PER_TRADE_CENTS")
 
+        # ---- depth-aware execution ----
+        if self.max_entry_slippage_cents < 0:
+            issues.append("MAX_ENTRY_SLIPPAGE_CENTS cannot be negative")
+        if self.exit_depth_slippage_cents < 0:
+            issues.append("EXIT_DEPTH_SLIPPAGE_CENTS cannot be negative")
+        if self.max_entry_slippage_cents > self.max_spread_cents:
+            issues.append(
+                "MAX_ENTRY_SLIPPAGE_CENTS must be <= MAX_SPREAD_CENTS, or an entry "
+                "may pay more slippage than the spread the strategy refuses to trade"
+            )
+
         # ---- loop ----
         if self.loop_seconds <= 0:
             issues.append("TRADE_LOOP_SECONDS must be positive")
@@ -839,6 +876,9 @@ class Settings:
             "min_cost_per_trade_cents": self.min_cost_per_trade_cents,
             "loop_seconds": self.loop_seconds,
             "loop_min_seconds": self.loop_min_seconds,
+            "depth_aware_sizing": bool(self.depth_aware_sizing),
+            "max_entry_slippage_cents": self.max_entry_slippage_cents,
+            "exit_depth_slippage_cents": self.exit_depth_slippage_cents,
             "book_max_age_seconds": self.book_max_age_seconds,
             "maker_improve_cents": self.maker_improve_cents,
             "entry_rest_seconds": self.entry_rest_seconds,

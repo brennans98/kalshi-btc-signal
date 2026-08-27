@@ -61,7 +61,16 @@ def _blank():
             "time_exits": 0,
             "chart_exits": 0,
             "settlement_exits": 0,
+            # Net of fees -- the number that says whether this works.
             "realized_cents": 0,
+            # Exact fractional accumulators; the integers above are rounded
+            # views of these, so partial exits do not accumulate rounding drift.
+            "realized_cents_exact": 0.0,
+            "gross_cents_exact": 0.0,
+            "fees_cents_exact": 0.0,
+            # Gross and fees kept separately so the cost of trading is visible.
+            "realized_gross_cents": 0,
+            "fees_cents": 0,
             "wins": 0,
             "losses": 0,
         },
@@ -70,6 +79,31 @@ def _blank():
 
 def _path(mode):
     return config.settings.lots_path(mode)
+
+
+def _round_half_up(value):
+    """Round to a whole cent, half away from zero.
+
+    Python's built-in round() is banker's rounding: round(12.5) is 12, not 13.
+    For money that is both surprising and biased in a way that shows up in
+    aggregates, so money rounding is explicit here.
+    """
+    return int(math.floor(value + 0.5)) if value >= 0 else -int(math.floor(-value + 0.5))
+
+
+def _modeled_fee_per_contract(price_cents):
+    """Published Kalshi taker fee for one contract at this price, in cents.
+
+    0.07 * P * (1 - P) with P in dollars. Used only when the exchange has not
+    told us the real number -- dryrun, adopted positions, or a response missing
+    the field. Deliberately the TAKER rate: assuming the cheaper maker rate
+    would understate costs, and this number exists to stop costs being
+    understated.
+    """
+    if price_cents is None:
+        return 0.0
+    p = max(0.0, min(1.0, float(price_cents) / 100.0))
+    return 0.07 * p * (1 - p) * 100.0
 
 
 def load(mode):
@@ -219,12 +253,19 @@ def record_entry(
     settle_only=False,
     lane=None,
     conviction=None,
+    entry_fee_cents=None,
 ):
     """Open (or add to) a lot. Averages the basis if a lot already exists.
 
     lane and conviction are the signal's provenance: which entry path fired
     and how strong it read (0-100). Stored per lot so the trade record can be
     grouped by lane afterwards.
+
+    entry_fee_cents is the fee PER CONTRACT actually charged on this entry
+    (Kalshi reports it as average_fee_paid), stored so realized P&L can be
+    reported net. Reporting gross P&L on a market where a round trip costs
+    roughly 3-4c per contract in fees makes a losing strategy look breakeven,
+    which is the single most misleading number a trading bot can produce.
 
     stop_cents is the volatility-scaled stop the signal computed at entry
     time; it is stored on the lot so plan() honors the stop the trade was
@@ -264,6 +305,13 @@ def record_entry(
             existing["conviction"] = int(conviction)
         existing["tiers_done"] = []
         existing["peak_gain"] = 0
+        # Fees follow the same weighted average as the basis, so a lot built
+        # from two fills at different fee rates carries the blended cost.
+        if entry_fee_cents is not None:
+            prior_fee = float(existing.get("entry_fee_cents") or 0.0)
+            existing["entry_fee_cents"] = round(
+                (held * prior_fee + count * float(entry_fee_cents)) / (held + count), 4
+            )
         state["lots"][lot_key] = existing
     else:
         state["lots"][lot_key] = {
@@ -284,6 +332,9 @@ def record_entry(
             "tiers_done": [],
             "peak_gain": 0,
             "last_bid": entry_price,
+            # Fee per contract paid to open. None means unknown (an adopted
+            # position, or an exchange response without the field).
+            "entry_fee_cents": None if entry_fee_cents is None else round(float(entry_fee_cents), 4),
         }
 
     save(mode, state)
@@ -609,8 +660,19 @@ def plan(lot, bid, now=None, include_profit=True, trend=None):
     return intents
 
 
-def record_exit(mode, lot_key, tier, kind, count, exit_price):
-    """Reduce the lot and update statistics. Returns realized cents."""
+def record_exit(mode, lot_key, tier, kind, count, exit_price, exit_fee_cents=None):
+    """Reduce the lot and update statistics. Returns realized cents, NET OF FEES.
+
+    Previously this returned the gross price difference. On this market a taker
+    round trip costs roughly 3-4c per contract, and a scalp aims at a handful of
+    cents, so gross P&L does not merely flatter the record -- it can invert its
+    sign. A strategy averaging +2c gross per contract is losing money, and the
+    old number reported it as winning.
+
+    exit_fee_cents is the fee per contract on this exit leg. When the exchange
+    reports it we use that; otherwise we fall back to the published taker
+    formula, which is the conservative assumption (maker fills are cheaper).
+    """
     state = load(mode)
     lot = (state.get("lots") or {}).get(lot_key)
     if not lot:
@@ -620,14 +682,41 @@ def record_exit(mode, lot_key, tier, kind, count, exit_price):
     if count <= 0:
         return 0
 
-    realized = int(round((exit_price - lot["entry_price"]) * count))
+    gross = (exit_price - lot["entry_price"]) * count
+
+    # Entry fee is apportioned across the contracts being closed, so a lot
+    # exited in pieces pays its entry fee once in total rather than once per
+    # partial exit.
+    entry_fee_per_contract = lot.get("entry_fee_cents")
+    if entry_fee_per_contract is None:
+        entry_fee_per_contract = _modeled_fee_per_contract(lot["entry_price"])
+    if exit_fee_cents is None:
+        exit_fee_cents = _modeled_fee_per_contract(exit_price)
+
+    fees = (float(entry_fee_per_contract) + float(exit_fee_cents)) * count
+    realized_exact = gross - fees
+    realized = _round_half_up(realized_exact)
     lot["count_open"] = lot["count_open"] - count
 
     if kind == "profit" and tier not in (lot.get("tiers_done") or []):
         lot.setdefault("tiers_done", []).append(tier)
 
+    # Totals accumulate in EXACT fractional cents and are only rounded for
+    # display. Rounding each partial exit before adding it loses up to half a
+    # cent every time, and a lot that scales out in five pieces drifts from its
+    # own true P&L -- a bot that cannot add up its own results correctly cannot
+    # be evaluated at all.
     stats = state["stats"]
-    stats["realized_cents"] = stats.get("realized_cents", 0) + realized
+    stats["realized_cents_exact"] = float(stats.get("realized_cents_exact", 0.0)) + realized_exact
+    stats["gross_cents_exact"] = float(stats.get("gross_cents_exact", 0.0)) + gross
+    stats["fees_cents_exact"] = float(stats.get("fees_cents_exact", 0.0)) + fees
+
+    stats["realized_cents"] = _round_half_up(stats["realized_cents_exact"])
+    # Kept alongside the net figure so the cost of trading is visible rather
+    # than merely subtracted. If gross is healthy and net is not, the strategy
+    # is trading too often for the edge it has.
+    stats["realized_gross_cents"] = _round_half_up(stats["gross_cents_exact"])
+    stats["fees_cents"] = _round_half_up(stats["fees_cents_exact"])
 
     if kind == "profit":
         stats["tier_hits"][tier] = stats["tier_hits"].get(tier, 0) + 1

@@ -277,3 +277,80 @@ Nothing here makes the strategy more likely to be right. It removes ways for the
 bot to lose money by malfunctioning rather than by being wrong. The market
 exposure is unchanged, and no amount of this work makes a position on a binary
 market safe.
+
+## Pass 3 — execution accuracy
+
+Predictive accuracy on a 15-minute binary market cannot approach 100%; anything
+claiming otherwise is selling confidence. **Execution** accuracy can: given a
+decision, the bot should carry it out exactly, price it correctly, and report the
+result truthfully, every time. This pass audited every action for that, and every
+fix below is covered by a test in `tests/test_execution.py` that fails without it.
+
+### Realized P&L was gross, not net
+
+`record_exit` returned the raw price difference. A taker round trip on this market
+costs roughly 3–4c per contract and a scalp targets a handful of cents, so gross
+P&L does not merely flatter the record — it can invert its sign. A strategy
+averaging +2c gross per contract is losing money, and the old number called it a
+win. P&L is now net of fees, with `realized_gross_cents` and `fees_cents` reported
+alongside so the cost of trading is visible rather than silently absorbed.
+
+Entry fees are stored per contract on the lot (the exchange's `average_fee_paid`
+when available, otherwise the published taker formula — the conservative
+assumption) and apportioned across partial exits, so scaling out is not charged
+the entry fee repeatedly. Settlement is fee-free and passes an explicit zero.
+
+### Exits were booked at the limit price, not the fill price
+
+A sell IOC at limit P fills against bids at or above P, so the average fill is at
+least as good as the limit. Recording the limit understated every profitable exit.
+Exits now use the exchange's reported VWAP and its actual fee. In dryrun, where
+assumptions *are* the record, the assumptions are deliberately pessimistic: fill
+at the limit, pay the taker rate.
+
+### Rounding drift across partial exits
+
+Each partial exit rounded its own P&L to a whole cent, so a lot exited in halves
+lost a cent against a lot exited at once. Totals now accumulate in exact
+fractional cents and are rounded only for display. Money rounding is explicit
+half-up, because Python's `round(12.5)` is 12 — surprising and biased for money.
+
+### Resting orders that filled in pieces understated the day's deployment
+
+`record_trade` was called once per resting order, so contracts that filled later
+never reached `cost_today_cents`. Subsequent fills now call `record_cost`, which
+adds deployed money without counting a new trade — the same order is still one
+trade for pacing purposes.
+
+### Clock drift is now a trading fault
+
+The market expires on the exchange's clock; every deadline in this bot is measured
+against the local one. A clock running behind makes the bot believe it has more
+time than it does, which delays the settlement guard and can leave a position
+unexited at expiry — a total loss on that position rather than a small one.
+
+The client now estimates its offset from the exchange on every HTTP response
+(server `Date` header, compared against the request midpoint so latency is not
+mistaken for drift, exponentially smoothed). The estimate can only ever *shorten*
+the trading window, never widen it, and is bounded at 30s. Beyond two minutes it
+is treated as a broken clock and trading stops, because a wildly wrong skew
+applied as a correction would silently halt trading while looking like a strategy
+that found no setups. Clock health is on the dashboard payload.
+
+`close_epoch` also now treats a timezone-less close time as UTC. `datetime.timestamp()`
+reads a naive datetime as *local* time, which would put the close hours away —
+a silent, total failure rather than a noisy partial one.
+
+### Two bugs the tests caught while being written
+
+- The mirrored ask ladder was built worst-first, which would have priced every
+  sweep at the worst level on the book.
+- A broken clock reported "feed is stale", because the feed-age check ran first
+  and also uses the local clock. An accurate veto for the wrong reason is still a
+  debugging trap, so the clock check runs first.
+
+### What this does not do
+
+None of this improves prediction. It makes the bot's own record trustworthy, which
+is the prerequisite for judging whether the prediction is any good — the previous
+numbers were optimistic in at least three independent ways at once.

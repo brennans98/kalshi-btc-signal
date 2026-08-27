@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 
 import config
+import policy
 import store
 
 
@@ -284,6 +285,18 @@ def record_trade(ticker, count, cost_cents):
     return state
 
 
+def record_cost(cost_cents):
+    """Add deployed cost to the day WITHOUT counting a new trade.
+
+    For subsequent partial fills on a resting order: the same order, so the same
+    trade for pacing purposes, but real additional money committed.
+    """
+    state = load_state()
+    state["cost_today_cents"] = int(state.get("cost_today_cents", 0)) + int(cost_cents or 0)
+    save_state(state)
+    return state
+
+
 def check(signal, balance_cents, open_position_count, open_tickers):
     """Decide whether an ENTRY may be executed.
 
@@ -367,6 +380,25 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         budget_cents // price,
     )
 
+    # ---- what the book can actually supply -------------------------------
+    # Entries are fill-or-kill: the whole size must be available at or inside
+    # the limit price, or nothing happens at all. Sizing purely from the budget
+    # asked for contracts that were not there, so the order was killed and the
+    # bot logged "unfilled" and moved on. Cap the request at the depth we are
+    # willing to reach, and price it at the worst level we would touch so the
+    # order can actually complete.
+    levels = [
+        (int(level[0]), int(level[1]))
+        for level in (signal.get("entry_levels") or [])
+        if isinstance(level, (list, tuple)) and len(level) >= 2
+    ]
+    reachable = policy.depth_within(levels, cfg.max_entry_slippage_cents)
+
+    if cfg.depth_aware_sizing and levels:
+        if reachable < 1:
+            return False, "No resting offers within the entry slippage cap", None
+        count = min(count, reachable)
+
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
 
@@ -398,10 +430,63 @@ def check(signal, balance_cents, open_position_count, open_tickers):
             f"(budget {budget_cents}c at {price}c/contract)"
         ), None
 
+    # ---- price the order against the ladder, not the top of book ----------
+    # The edge was measured against the best offer. Filling more contracts than
+    # rest there means paying an AVERAGE price worse than that, which spends
+    # part of the edge before the position even exists. Shrink until the edge
+    # at the average fill price still clears the fee floor. Average price is
+    # non-decreasing in size, so the largest size that clears is found by
+    # walking down; if nothing clears, the trade is refused rather than taken
+    # at a price the model never approved.
+    fill = None
+    if cfg.depth_aware_sizing and levels:
+        fair_prob = signal.get("fair_prob")
+        min_edge = signal.get("min_required_edge_cents")
+        holds_to_settlement = signal.get("late_settlement") or signal.get("favorite")
+
+        while count >= 1:
+            candidate = policy.sweep(levels, count)
+            if candidate["filled"] < count:
+                # Should not happen after the depth cap, but never send an
+                # order the book cannot fill.
+                count = candidate["filled"]
+                continue
+            if candidate["cost_cents"] > budget_cents:
+                count -= 1
+                continue
+            if (
+                isinstance(fair_prob, (int, float))
+                and isinstance(min_edge, (int, float))
+                and not holds_to_settlement
+            ):
+                edge_at_fill = float(fair_prob) * 100 - candidate["avg_price_cents"]
+                if edge_at_fill < float(min_edge):
+                    count -= 1
+                    continue
+            fill = candidate
+            break
+
+        if count < 1 or fill is None:
+            return False, (
+                "Edge does not survive the average fill price at any size "
+                "(the book is too thin to enter without giving the edge back)"
+            ), None
+
+    cost_cents = fill["cost_cents"] if fill else count * price
+    limit_price = fill["worst_price_cents"] if fill else price
+    avg_price = fill["avg_price_cents"] if fill else float(price)
+
     return True, "Within limits", {
         "count": count,
-        "cost_cents": count * price,
+        "cost_cents": cost_cents,
         "budget_cents": budget_cents,
         "conviction": conviction,
         "lane": lane,
+        # The limit the order must carry for a fill-or-kill of this size to
+        # complete: the worst level it will touch, not the best.
+        "limit_price_cents": limit_price,
+        "avg_price_cents": avg_price,
+        "slippage_cents": round(avg_price - price, 3),
+        "est_entry_fee_cents": round(fill["fee_cents"], 2) if fill else None,
+        "book_depth_reachable": reachable,
     }

@@ -22,6 +22,7 @@ of every one of them.
 
 import base64
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -68,6 +69,11 @@ class KalshiClient:
         self.ws_url = PROD_WS_URL if cfg.kalshi_env == "prod" else DEMO_WS_URL
         self._key_error = None
         self._http = None
+
+        # Clock drift tracking against the exchange (see _observe_clock).
+        self.clock_skew_seconds = None
+        self.clock_rtt_seconds = 0.0
+        self.clock_samples = 0
 
         try:
             self.private_key = _load_private_key(cfg.private_key_pem)
@@ -154,6 +160,7 @@ class KalshiClient:
                 raise KalshiAuthError(self.credential_error)
             headers = self._sign(method, endpoint)
 
+        sent_at = time.time()
         try:
             response = await self._client().request(
                 method.upper(),
@@ -164,6 +171,8 @@ class KalshiClient:
             )
         except Exception as error:
             raise KalshiApiError(f"{method.upper()} {endpoint} transport error: {error}")
+
+        self._observe_clock(response, sent_at, time.time())
 
         if response.status_code in (401, 403):
             raise KalshiAuthError(
@@ -184,6 +193,76 @@ class KalshiClient:
             return response.json()
         except ValueError:
             return {}
+
+    def _observe_clock(self, response, sent_at, received_at):
+        """Estimate how far our clock is ahead of the exchange's.
+
+        Every decision about time-to-close is made against the local clock, but
+        the market closes on the exchange's clock. If ours drifts behind, we
+        believe there is more time left than there is -- the settlement guard
+        fires late and a position can reach expiry unexited, which is a total
+        loss on that position rather than a small one. NTP normally keeps this
+        within milliseconds; this exists so that when it does not, we find out
+        from data instead of from a loss.
+
+        The server Date header is second-granular, so the estimate is only good
+        to about a second. That is precise enough for its purpose: it is a
+        drift alarm, not a time source.
+        """
+        raw_date = None
+        try:
+            raw_date = response.headers.get("Date")
+        except Exception:
+            return
+        if not raw_date:
+            return
+
+        try:
+            server_epoch = parsedate_to_datetime(raw_date).timestamp()
+        except (TypeError, ValueError, IndexError):
+            return
+
+        # Compare against the midpoint of the request, so one-way network
+        # latency does not masquerade as clock drift.
+        local_midpoint = (sent_at + received_at) / 2.0
+        sample = local_midpoint - server_epoch
+
+        self.clock_rtt_seconds = max(0.0, received_at - sent_at)
+        # Exponential smoothing: a single sample is dominated by the header's
+        # one-second granularity, so no single reading should move the estimate
+        # far.
+        if self.clock_skew_seconds is None:
+            self.clock_skew_seconds = sample
+        else:
+            self.clock_skew_seconds = 0.8 * self.clock_skew_seconds + 0.2 * sample
+        self.clock_samples += 1
+
+    def clock_status(self):
+        """Skew estimate for the dashboard, plus the guard adjustment it implies."""
+        skew = self.clock_skew_seconds
+        # Only trust the estimate once smoothing has had a few samples, and
+        # never let it widen the trading window -- only shorten it.
+        trusted = skew is not None and self.clock_samples >= 5
+        # A huge reading means the local clock is broken, not that the market
+        # closes nine days early. Shortening the window by that amount would
+        # silently stop all trading and look like a strategy that found no
+        # setups. Past this bound it is an alarm to act on, not a correction to
+        # quietly apply.
+        severe = bool(trusted and abs(skew) > 120.0)
+        adjustment = 0.0
+        if trusted and not severe:
+            adjustment = max(-30.0, min(0.0, skew))
+
+        return {
+            "skew_seconds": None if skew is None else round(skew, 3),
+            "rtt_seconds": round(self.clock_rtt_seconds, 4),
+            "samples": self.clock_samples,
+            "trusted": bool(trusted),
+            # Second-granular header, so treat anything under ~1.5s as noise.
+            "drifting": bool(trusted and abs(skew) > 1.5),
+            "severe": severe,
+            "guard_adjustment_seconds": round(adjustment, 3),
+        }
 
     # ---- market data (public) ----
 
@@ -299,6 +378,41 @@ class KalshiClient:
             return int(float((response or {}).get("fill_count") or 0))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def average_fill_price_cents(response):
+        """The VWAP the order ACTUALLY filled at, in cents, or None.
+
+        Kalshi returns `average_fill_price` as a fixed-point dollar string, and
+        only when fill_count > 0. This matters because an order that sweeps more
+        than one price level does not fill at the best offer, and recording the
+        best offer as the entry basis makes every downstream number wrong: the
+        stop sits in the wrong place, the trail arms early, and realized P&L is
+        overstated by exactly the slippage. Using the exchange's own VWAP means
+        the basis is not a model of the fill, it is the fill.
+        """
+        raw = (response or {}).get("average_fill_price")
+        if raw is None:
+            return None
+        try:
+            return float(raw) * 100.0
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def average_fee_paid_cents(response):
+        """Fee actually charged per contract, in cents, or None.
+
+        Also fixed-point dollars, also only present when fill_count > 0. The
+        modeled fee is an estimate that rounds per fill; this is the real number.
+        """
+        raw = (response or {}).get("average_fee_paid")
+        if raw is None:
+            return None
+        try:
+            return float(raw) * 100.0
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _fp_int(value):

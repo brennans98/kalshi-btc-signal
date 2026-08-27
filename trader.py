@@ -119,7 +119,7 @@ def _order_id(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:16]}"
 
 
-def snapshot():
+def snapshot(client=None):
     """Everything the dashboard needs about the trader."""
     active = mode()
     state = risk.load_state()
@@ -139,6 +139,11 @@ def snapshot():
     # restart will forget open positions and any latched halt -- which matters
     # more than anything else on this payload.
     payload["storage"] = store.status()
+    # Clock health. Time-to-close drives the settlement guard, the late-entry
+    # window and every exit deadline, so a drifting clock is a trading fault --
+    # visible here rather than discovered through an unexited expiry.
+    if client is not None:
+        payload["clock"] = client.clock_status()
     return payload
 
 
@@ -244,15 +249,25 @@ def _record_pending_fills(pending_key, pending, filled_total):
         settle_only=bool(pending.get("settle_only")),
         lane=pending.get("lane"),
         conviction=pending.get("conviction"),
+        # A resting order is a maker fill by construction, and fills at exactly
+        # its limit price -- so the price is exact and the fee is the maker rate
+        # (zero for this series today).
+        entry_fee_cents=policy.maker_fee_cents(1, price),
     )
     pending["filled_recorded"] = filled_total
 
     if not pending.get("trade_counted"):
         # One resting order is one trade for pacing purposes (cooldown, daily
-        # cap), counted when its first contract lands. Later partial fills
-        # extend the same lot at the same price.
+        # cap), counted when its first contract lands.
         risk.record_trade(pending["ticker"], filled_total, filled_total * price)
         pending["trade_counted"] = True
+    else:
+        # Later partial fills on the same resting order are not new trades, but
+        # they ARE new money deployed. Previously only the contracts filled at
+        # the moment the order first traded were added to the day's cost, so a
+        # resting order that filled in pieces silently understated the day's
+        # deployment for the rest of the session.
+        risk.record_cost(new_fill * price)
 
     scalp.pending_put("live", pending_key, pending)
 
@@ -495,8 +510,17 @@ async def _settle_stale_lot(client, active, lot):
 
     won = result == lot["side"]
     count = lot.get("count_open") or 0
+    # Settlement is fee-free on Kalshi: a contract held to expiry pays 100c or
+    # 0c with no exit fee. Passing 0 explicitly stops the fallback fee model
+    # from inventing an exit cost that was never charged.
     realized = scalp.record_exit(
-        active, lot["key"], "settlement", "settlement", count, 100 if won else 0
+        active,
+        lot["key"],
+        "settlement",
+        "settlement",
+        count,
+        100 if won else 0,
+        exit_fee_cents=0.0,
     )
     outcome = "settled_win" if won else "settled_loss"
     reason = (
@@ -755,8 +779,16 @@ async def _poll_exit_orders(client, lot):
         new_fill = filled - int(rung.get("filled_recorded") or 0)
 
         if new_fill > 0:
+            # A resting rung fills AT its limit price, so that price is the
+            # true fill. The fee is the maker rate for this series.
             realized = scalp.record_exit(
-                "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+                "live",
+                lot["key"],
+                tier_name,
+                "profit",
+                new_fill,
+                rung["price_cents"],
+                exit_fee_cents=policy.maker_fee_cents(1, rung["price_cents"]),
             )
             rung["filled_recorded"] = filled
             changed = True
@@ -825,7 +857,13 @@ async def _cancel_exit_orders(client, lot):
             new_fill = filled - int(rung.get("filled_recorded") or 0)
             if new_fill > 0:
                 realized = scalp.record_exit(
-                    "live", lot["key"], tier_name, "profit", new_fill, rung["price_cents"]
+                    "live",
+                    lot["key"],
+                    tier_name,
+                    "profit",
+                    new_fill,
+                    rung["price_cents"],
+                    exit_fee_cents=policy.maker_fee_cents(1, rung["price_cents"]),
                 )
                 rung["filled_recorded"] = filled
                 risk.log_decision(
@@ -1009,6 +1047,13 @@ async def _execute_exit(client, active, lot, intent):
     ticker, side = lot["ticker"], lot["side"]
     count, price = intent["count"], intent["limit_price"]
 
+    # What we assume until the exchange tells us otherwise. In dryrun these
+    # assumptions ARE the record, so they are deliberately pessimistic: fill at
+    # the limit (never better) and pay the taker fee. A simulation that assumes
+    # the good version of both is how a bot looks profitable on paper.
+    exit_price = float(price)
+    exit_fee = policy.taker_fee_cents(1, price)
+
     record = {
         "event": "exit",
         "mode": active,
@@ -1061,8 +1106,22 @@ async def _execute_exit(client, active, lot, intent):
         count = min(count, filled)
         record["filled"] = filled
 
+        # A sell IOC at limit P fills against bids at or above P, so the
+        # average fill is at least as good as the limit. Recording the limit
+        # understated every profitable exit. Use the exchange's VWAP and its
+        # real fee.
+        actual_exit = client.average_fill_price_cents(response)
+        actual_exit_fee = client.average_fee_paid_cents(response)
+        if actual_exit is not None:
+            record["actual_exit_price_cents"] = round(actual_exit, 3)
+            exit_price = actual_exit
+        if actual_exit_fee is not None:
+            record["actual_exit_fee_cents"] = round(actual_exit_fee, 3)
+            exit_fee = actual_exit_fee
+
     realized = scalp.record_exit(
-        active, lot["key"], intent["tier"], intent["kind"], count, price
+        active, lot["key"], intent["tier"], intent["kind"], count, exit_price,
+        exit_fee_cents=exit_fee,
     )
 
     if intent["kind"] == "stop":
@@ -1133,8 +1192,26 @@ async def run_entry(client, signal, market):
 
     ticker = signal["ticker"]
     side = signal["side"]
-    price = int(signal["price_cents"])
     count = sizing["count"]
+
+    # The price the edge was measured at (best offer) and the price the order
+    # must carry to actually complete. They differ whenever the size we want is
+    # deeper than the best level. Sending the best offer as the limit on a
+    # fill-or-kill order for more contracts than rest there guarantees a kill:
+    # the exchange cannot fill the whole size at that price, so it fills none.
+    quoted_price = int(signal["price_cents"])
+    price = int(sizing.get("limit_price_cents") or quoted_price)
+    # The modeled average, used as the basis only until the exchange tells us
+    # the real one.
+    expected_basis = float(sizing.get("avg_price_cents") or price)
+    # Overwritten with the exchange's real VWAP once the order comes back. In
+    # dryrun the modeled sweep average IS the basis -- which is the point of
+    # modeling it, so a dry run's P&L reflects slippage instead of pretending
+    # every order fills at the top of book.
+    basis_cents = expected_basis
+    # Pessimistic until the exchange reports the real figure, for the same
+    # reason as the exit: a dry run must not assume the cheap version.
+    entry_fee_cents = policy.taker_fee_cents(1, expected_basis)
 
     # A late settlement snipe always enters as a taker: a resting post-only
     # bid has no time to fill this close to settlement, and an unfilled
@@ -1180,36 +1257,78 @@ async def run_entry(client, signal, market):
         # V2 returns 201 even when a fill-or-kill order is killed unfilled.
         # An unfilled entry is not a trade: no lot, no cooldown, no daily count.
         filled = client.filled_count(response)
-        if filled < count:
+
+        if filled <= 0:
             record["outcome"] = "unfilled"
-            record["filled"] = filled
+            record["filled"] = 0
             status["last_decision"] = {
                 "outcome": "unfilled",
                 "reason": (
-                    f"FOK entry killed unfilled ({filled}/{count} "
+                    f"FOK entry killed unfilled (0/{count} "
                     f"{side} @ {price}c on {ticker})"
                 ),
             }
             risk.log_decision(record)
             return
 
+        if filled < count:
+            # Fill-or-kill should make this impossible, so reaching it means an
+            # assumption about the exchange is wrong. The old code returned here
+            # without recording anything -- which would leave a REAL position
+            # open on Kalshi that the bot does not know it owns: no stop, no
+            # trail, no exit, discovered only at the next reconcile. Record what
+            # actually filled and manage it.
+            record["partial_fill"] = {"requested": count, "filled": filled}
+            status["last_error"] = (
+                f"Entry partially filled ({filled}/{count}) despite fill-or-kill; "
+                f"managing the {filled} contracts that filled"
+            )
+            count = filled
+
+        # The exchange's own volume-weighted fill price, which is the only
+        # correct basis for the stop, the trail and P&L. Fall back to the
+        # modeled sweep average only if the field is absent.
+        actual_basis = client.average_fill_price_cents(response)
+        actual_fee = client.average_fee_paid_cents(response)
+        if actual_basis is not None:
+            basis_cents = actual_basis
+        if actual_fee is not None:
+            entry_fee_cents = actual_fee
+        record["fill"] = {
+            "filled": filled,
+            "quoted_price_cents": quoted_price,
+            "limit_price_cents": price,
+            "expected_basis_cents": round(expected_basis, 3),
+            "actual_basis_cents": None if actual_basis is None else round(actual_basis, 3),
+            "actual_fee_cents_per_contract": None if actual_fee is None else round(actual_fee, 3),
+            "slippage_vs_quote_cents": round(basis_cents - quoted_price, 3),
+        }
+
     # Recorded in both live and dryrun. Cooldown and the daily trade cap are
     # pacing limits, not capital controls -- they need to be exercised in
     # dryrun too, or a dry run can fire trades back-to-back at a rate live
     # trading never could, making the simulation misleading.
-    risk.record_trade(ticker, count, sizing["cost_cents"])
+    # Cost recorded from the basis actually paid, not the quoted price. The
+    # daily loss limit and pacing counters are only as accurate as this number.
+    actual_cost_cents = int(round(count * basis_cents))
+    risk.record_trade(ticker, count, actual_cost_cents)
 
+    # The lot's entry price is the basis actually paid, rounded to the cent.
+    # Every exit decision -- stop distance, trail arming, the runner's peak --
+    # measures from this number, so recording the quoted price instead of the
+    # filled price biased every one of them in the same direction.
     scalp.record_entry(
         active,
         ticker,
         side,
         count,
-        price,
+        int(round(basis_cents)),
         policy.close_epoch(market),
         stop_cents=signal.get("stop_cents"),
         settle_only=bool(signal.get("late_settlement") or signal.get("favorite")),
         lane=signal.get("lane"),
         conviction=signal.get("conviction"),
+        entry_fee_cents=entry_fee_cents,
     )
 
     targets = signal.get("scalp_targets") or {}
@@ -1221,7 +1340,10 @@ async def run_entry(client, signal, market):
         "ticker": ticker,
         "side": side,
         "count": count,
-        "price_cents": price,
+        "price_cents": int(round(basis_cents)),
+        "quoted_price_cents": quoted_price,
+        "limit_price_cents": price,
+        "slippage_cents": round(basis_cents - quoted_price, 2),
         "targets": targets,
         "stop_cents": signal.get("stop_price_cents"),
         "simulated": active != "live",
@@ -1231,7 +1353,12 @@ async def run_entry(client, signal, market):
         "outcome": record["outcome"],
         "reason": (
             f"{'Bought' if active == 'live' else 'Simulated'} {count} {side} "
-            f"@ {price}c on {ticker}"
+            f"@ {basis_cents:.2f}c on {ticker}"
+            + (
+                f" (quoted {quoted_price}c, limit {price}c)"
+                if abs(basis_cents - quoted_price) >= 0.005
+                else ""
+            )
         ),
     }
 
