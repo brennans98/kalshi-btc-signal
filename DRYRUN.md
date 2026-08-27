@@ -18,6 +18,48 @@ its own right. Dockge manages the container; the bot's own page shows the price,
 P&L, ladder, health and trade log. Two tabs, or one reverse proxy putting both on
 one hostname.
 
+## What the repo can and cannot change on the server
+
+Worth being exact about, because it decides who does what.
+
+Dockge is **not** GitOps. Its stacks live on the server itself, at
+`/opt/stacks/<name>/compose.yaml`, and it never reads from GitHub. So a change to
+`deploy/compose.dryrun.yaml` in this repo does not reach Dockge on its own. The
+compose file and the environment variables have to be entered in Dockge once, by
+hand.
+
+After that one-time setup, **code changes do flow automatically**:
+
+1. A commit lands on `main`.
+2. `.github/workflows/ci.yml` runs the suite, the config check and a payload
+   render. If any fail, nothing is published — the server keeps running the last
+   good image.
+3. If they pass, it builds and pushes `ghcr.io/brennans98/kalshi-btc-signal:latest`.
+4. In Dockge you press **Update** on the stack. It pulls the new image and
+   restarts. The named volume keeps positions and halt state across the restart.
+
+So: compose and secrets are yours to enter once; the code that runs is whatever
+passed CI. Nothing reaches your server without you pressing Update.
+
+### One-time: let the server pull the image
+
+The GHCR package is private, which is correct — the image layers contain the
+source. A private package cannot be pulled anonymously, so log the Docker daemon
+in once, on the server:
+
+```bash
+# A classic PAT with read:packages scope is enough. Not a fine-grained token --
+# GHCR still wants a classic one for this.
+echo "$GHCR_PAT" | docker login ghcr.io -u brennans98 --password-stdin
+```
+
+That credential persists in `~/.docker/config.json`, so it is a one-time step.
+If `docker pull` returns `denied`, this login is what is missing.
+
+The alternative is making the package public in the repo's package settings. It
+holds no secrets — credentials are injected at runtime, never baked in — but it
+would publish your strategy code, so prefer the login.
+
 ## 1. Deploy the stack
 
 In Dockge: **+ Compose** → name it `btc-bot-dryrun` → paste
