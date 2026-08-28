@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Mobile-friendly ops helper. Short commands, short output.
+# Usage: bot <status|clock|logs|follow|health|net|restart|update>
+set -euo pipefail
+C=btc-bot-live
+P=${PORT:-8000}
+
+case "${1:-status}" in
+  status)  # one screen: container, health, trader
+    docker ps --filter name=$C --format '{{.Names}}  {{.Status}}'
+    curl -sf 127.0.0.1:$P/health | python3 -m json.tool ;;
+  clock)   # NTP + exchange skew
+    chronyc tracking | grep -E 'System time|RMS offset'
+    curl -sf 127.0.0.1:$P/api/state | python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["trader"].get("clock"))' ;;
+  logs)    docker logs --tail 40 $C ;;
+  follow)  docker logs -f --tail 10 $C ;;
+  health)  curl -sf 127.0.0.1:$P/health | python3 -m json.tool ;;
+  net)     # is the WS book live, and how fast is Kalshi REST?
+    curl -sf 127.0.0.1:$P/api/state | python3 -c \
+      'import json,sys; k=json.load(sys.stdin)["kalshi"]; print("book:",k["book_source"],"err:",k["book_error"])'
+    curl -so /dev/null -w 'kalshi rtt: %{time_total}s (tls %{time_appconnect}s)\n' \
+      https://external-api.kalshi.com/trade-api/v2/exchange/status ;;
+  restart) docker restart $C && echo restarted ;;
+  update)  docker compose -f "$(dirname "$0")/compose.live.host.yaml" pull \
+           && docker compose -f "$(dirname "$0")/compose.live.host.yaml" up -d \
+           && echo updated ;;
+  *) echo "bot <status|clock|logs|follow|health|net|restart|update>" ;;
+esac

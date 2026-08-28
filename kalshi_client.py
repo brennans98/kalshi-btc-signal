@@ -22,6 +22,7 @@ of every one of them.
 
 import base64
 import binascii
+import os
 import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
@@ -33,8 +34,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import config
 
 WS_PATH = "/trade-api/ws/v2"
-PROD_WS_URL = "wss://api.elections.kalshi.com" + WS_PATH
-DEMO_WS_URL = "wss://demo-api.kalshi.co" + WS_PATH
+# Kalshi's dedicated WebSocket hosts (recommended for API integrations).
+# The shared api.elections.kalshi.com host remains supported; override with
+# KALSHI_WS_URL if the dedicated host ever misbehaves.
+PROD_WS_URL = os.environ.get("KALSHI_WS_URL") or "wss://external-api-ws.kalshi.com" + WS_PATH
+DEMO_WS_URL = os.environ.get("KALSHI_DEMO_WS_URL") or "wss://external-api-ws.demo.kalshi.co" + WS_PATH
 
 
 class KalshiAuthError(RuntimeError):
@@ -119,9 +123,28 @@ class KalshiClient:
         if self._http is None or self._http.is_closed:
             self._http = httpx.AsyncClient(
                 timeout=httpx.Timeout(10.0, connect=5.0),
-                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+                limits=httpx.Limits(
+                    max_keepalive_connections=8,
+                    max_connections=16,
+                    # Kalshi's edge closes idle connections; without an expiry
+                    # under the server's idle timeout, the first request after
+                    # a quiet stretch pays a full TCP+TLS handshake -- exactly
+                    # when the loop is trying to fire an urgent order.
+                    keepalive_expiry=50.0,
+                ),
             )
         return self._http
+
+    async def warm(self):
+        """Keep the pooled TLS connection hot with a cheap public request.
+
+        Called on a timer by app.py. A connection that sat idle past the
+        server's idle timeout is silently gone, and the next order pays the
+        full handshake to find out. Pinging /exchange/status well inside the
+        keepalive_expiry window means the pool always holds at least one
+        established connection when an order needs one.
+        """
+        await self.request("GET", "/exchange/status", authenticate=False)
 
     async def aclose(self):
         if self._http is not None and not self._http.is_closed:
