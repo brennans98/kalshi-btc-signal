@@ -1,0 +1,25 @@
+services:
+  btc-bot:
+    image: ghcr.io/brennans98/kalshi-btc-signal:latest
+    container_name: btc-bot-dryrun
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      TRADING_MODE: dryrun
+      KALSHI_ENV: prod
+      DATA_DIR: /app/data
+      PORT: "8000"
+    env_file:
+      - .env
+    volumes:
+      - btc-bot-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 20s
+
+volumes:
+  btc-bot-data:
