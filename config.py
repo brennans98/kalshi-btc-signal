@@ -80,8 +80,11 @@ def _float(name: str, default: float) -> float:
         return default
 
 
-PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+# Kalshi's dedicated Trade API hosts. Kalshi recommends these for API-first
+# integrations; the shared api.elections.kalshi.com host remains supported and
+# can be restored via KALSHI_BASE_URL if the dedicated host ever misbehaves.
+PROD_BASE_URL = _str("KALSHI_BASE_URL", "https://external-api.kalshi.com/trade-api/v2")
+DEMO_BASE_URL = _str("KALSHI_DEMO_BASE_URL", "https://external-api.demo.kalshi.co/trade-api/v2")
 
 VALID_MODES = ("off", "dryrun", "live")
 TIER_NAMES = ("small", "medium", "large")

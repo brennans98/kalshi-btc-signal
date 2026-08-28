@@ -1,0 +1,71 @@
+# Dockge stack for LIVE trading on host networking.
+#
+# Paste into Dockge as the stack's Compose tab, put credentials in the
+# Environment tab (Dockge writes .env), then Deploy.
+#
+# Why network_mode: host
+#   The default bridge network routes every outbound packet through veth ->
+#   docker0 -> NAT (and inbound through docker-proxy). For a latency-sensitive
+#   API loop that is pure overhead. Host mode gives the container the EC2
+#   instance's network stack directly: no NAT, no veth hop, no embedded DNS
+#   proxy (127.0.0.11) -- the container resolves through the host's
+#   systemd-resolved cache and the VPC resolver.
+#
+# What host mode changes
+#   - `ports:` is ignored; the process binds directly on the host. So the app
+#     binds 127.0.0.1 via UVICORN_HOST and is reached over an SSH tunnel:
+#         ssh -N -L 8000:127.0.0.1:8000 ec2-user@<host>
+#   - Container port = host port (8000). Nothing else on the box may use it.
+
+services:
+  btc-bot:
+    image: ghcr.io/brennans98/kalshi-btc-signal:latest
+    container_name: btc-bot-live
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      TRADING_MODE: live
+      KALSHI_ENV: prod
+      DATA_DIR: /app/data
+      PORT: "8000"
+      # Host networking exposes real host ports; keep the unauthenticated
+      # dashboard loopback-only and reach it over an SSH tunnel.
+      UVICORN_HOST: 127.0.0.1
+
+      # ---- maker-only execution ------------------------------------------
+      # Entries rest as post-only bids; post_only guarantees an order that
+      # would cross is rejected instead of filling as a taker.
+      ENTRY_STYLE: maker
+      EXIT_STYLE: maker
+      # The maker exit ladder only engages with the ladder profile; the
+      # runner profile deliberately exits as a taker (trail-based exits must
+      # cross). Ladder = strict maker on every profit exit.
+      EXIT_PROFILE: ladder
+      # Stops, trails, chart flips and the settlement guard still cross as
+      # takers by design: when the trade is wrong, certainty of exit is worth
+      # the fee. A post-only stop is not a stop.
+
+    env_file:
+      - .env
+
+    volumes:
+      - btc-bot-data:/app/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4)); sys.exit(0 if d.get('ok') else 1)\""]
+      interval: 30s
+      timeout: 6s
+      start_period: 40s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    stop_grace_period: 20s
+
+volumes:
+  btc-bot-data:

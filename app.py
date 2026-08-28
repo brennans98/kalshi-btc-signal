@@ -365,6 +365,16 @@ def _handle_ws_message(raw_message, ticker):
     msg_type = data.get("type")
     body = data.get("msg") or {}
 
+    if msg_type == "fill":
+        # One of OUR orders just traded. The fill channel is account-wide, so
+        # this fires for any market, including one we have rolled off of --
+        # exactly the case where a lingering resting order must be noticed.
+        # The push is a wake-up, not a source of truth: the trader immediately
+        # re-polls order status over REST, which remains authoritative for
+        # counts, prices and fees.
+        trader.notify_fill(body)
+        return
+
     if body.get("market_ticker") not in (None, ticker):
         return  # a stale message for a market we've since rolled off of
 
@@ -429,6 +439,21 @@ async def kalshi_orderbook_ws_worker():
                         }
                     )
                 )
+                # The fill channel is private and account-wide: every fill on
+                # our own orders is pushed the instant it happens, replacing
+                # PENDING_POLL_SECONDS of REST-poll latency with a push.
+                # Subscribed separately because it takes no market_tickers --
+                # scoping it to the current market would go blind to fills on
+                # a market we have just rolled off of.
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": 2,
+                            "cmd": "subscribe",
+                            "params": {"channels": ["fill"]},
+                        }
+                    )
+                )
 
                 backoff = 1
                 subscribed_ticker = ticker
@@ -442,6 +467,23 @@ async def kalshi_orderbook_ws_worker():
             state["book_error"] = f"ws: {str(error)[:160]}"
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
+
+
+async def kalshi_keepalive_worker():
+    """Keep the REST connection pool warm between orders.
+
+    Orders are placed over REST. The pool holds connections open, but a
+    quiet stretch longer than the idle timeout silently drops them, and the
+    next order pays a fresh TCP+TLS handshake at the worst possible moment.
+    A cheap public request every 20s -- well inside the client's 50s
+    keepalive_expiry -- keeps an established connection ready.
+    """
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await client.warm()
+        except Exception:
+            pass  # transient failure; the next order will reconnect anyway
 
 
 async def orderbook_rest_fallback_worker():
@@ -501,6 +543,7 @@ async def startup():
     asyncio.create_task(kalshi_market_discovery_worker())
     asyncio.create_task(kalshi_orderbook_ws_worker())
     asyncio.create_task(orderbook_rest_fallback_worker())
+    asyncio.create_task(kalshi_keepalive_worker())
 
     if config.settings.is_enabled:
         trader.set_book_provider(_live_book)

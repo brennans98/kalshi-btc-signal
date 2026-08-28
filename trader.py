@@ -112,6 +112,25 @@ def notify_book():
         pass
 
 
+def notify_fill(fill=None):
+    """A fill on one of our orders arrived over the WebSocket fill channel.
+
+    Called from app.py's WS worker. This collapses fill-discovery latency
+    from up to PENDING_POLL_SECONDS to the next tick: the poll throttle is
+    reset so the very next tick re-polls order status over REST, and the
+    loop is woken immediately. REST remains the source of truth for counts,
+    prices and fees -- the push only decides WHEN to look, never what to
+    record, so a duplicated or dropped push can never corrupt a lot.
+    """
+    global _last_pending_poll
+    _last_pending_poll = 0.0
+    status["last_fill_push"] = {
+        "ticker": (fill or {}).get("market_ticker"),
+        "at": int(time.time()),
+    }
+    notify_book()
+
+
 def mode():
     value = config.settings.trading_mode
     return value if value in config.VALID_MODES else "off"
