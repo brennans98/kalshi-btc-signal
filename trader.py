@@ -53,6 +53,8 @@ status = {
     "last_exit": None,
     "last_error": None,
     "balance_cents": None,
+    "exchange_balance_cents": None,
+    "balance_is_simulated": False,
     "open_positions": [],
     "reconciled_at": None,
     "adopted": [],
@@ -893,14 +895,44 @@ async def _cancel_exit_orders(client, lot):
     return scalp.get("live", lot["key"]) or lot
 
 
+def _sizing_balance_cents(real_cents, active_mode):
+    """The balance that drives sizing and the daily loss limit.
+
+    In dryrun, DRYRUN_BALANCE_CENTS (when > 0) stands in for the exchange
+    balance so the simulation exercises the strategy at the capital it was
+    designed for. A real account too small to afford one full-size entry
+    otherwise clamps every trade to max size and shrinks the effective daily
+    limit below a single trade, which measures something nobody designed.
+
+    LIVE MODE ALWAYS USES THE REAL BALANCE. The override is ignored for any
+    mode other than dryrun, so it can never inflate the size of a real order.
+    That guarantee is the whole reason this lives in one function.
+    """
+    if active_mode != "dryrun":
+        return real_cents
+    override = config.settings.dryrun_balance_cents
+    if override > 0:
+        return override
+    return real_cents
+
+
 async def reconcile(client):
     """Refresh balance and positions from Kalshi, adopting anything untracked."""
     active = mode()
     balance = await client.get_balance()
     positions = await client.get_positions()
 
-    status["balance_cents"] = balance.get("balance")
-    risk.note_balance(balance.get("balance"))
+    real_balance_cents = balance.get("balance")
+    sizing_balance_cents = _sizing_balance_cents(real_balance_cents, active)
+
+    # Kept separate so the dashboard can always show the true account value
+    # even while sizing runs against simulated capital.
+    status["exchange_balance_cents"] = real_balance_cents
+    status["balance_is_simulated"] = (
+        sizing_balance_cents != real_balance_cents and active == "dryrun"
+    )
+    status["balance_cents"] = sizing_balance_cents
+    risk.note_balance(sizing_balance_cents)
 
     open_positions = []
     for entry in positions.get("market_positions", []):

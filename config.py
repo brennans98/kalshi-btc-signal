@@ -340,6 +340,17 @@ class Settings:
     # $20 version. All the hard risk caps still apply on top -- this can only
     # ever spend LESS than they allow, never more.
     conviction_sizing: int = field(default_factory=lambda: _int("CONVICTION_SIZING", 1))
+
+    # ---- dryrun-only simulated capital ----------------------------------
+    # Sizing and the daily loss limit are both driven by account balance. On a
+    # small real account that clamps every entry to max size and shrinks the
+    # effective daily limit to a fraction of one trade, so a dryrun measures a
+    # strategy nobody designed. Setting this replaces the exchange balance for
+    # sizing purposes IN DRYRUN ONLY -- live mode always uses the real balance,
+    # enforced in trader._sizing_balance_cents and asserted by tests. 0 = off.
+    dryrun_balance_cents: int = field(
+        default_factory=lambda: _int("DRYRUN_BALANCE_CENTS", 0)
+    )
     min_cost_per_trade_cents: int = field(
         default_factory=lambda: _int("MIN_COST_PER_TRADE_CENTS", 500)
     )
@@ -759,6 +770,15 @@ class Settings:
             )
         if self.book_max_age_seconds <= 0:
             issues.append("BOOK_MAX_AGE_SECONDS must be positive")
+        if self.dryrun_balance_cents < 0:
+            issues.append("DRYRUN_BALANCE_CENTS cannot be negative")
+        if 0 < self.dryrun_balance_cents < self.min_cost_per_trade_cents:
+            issues.append(
+                f"DRYRUN_BALANCE_CENTS (${self.dryrun_balance_cents / 100:.2f}) is "
+                f"below MIN_COST_PER_TRADE_CENTS "
+                f"(${self.min_cost_per_trade_cents / 100:.2f}), so no entry could "
+                f"ever be afforded and the dryrun would record nothing"
+            )
 
         return issues
 
@@ -772,6 +792,21 @@ class Settings:
         rather than implicit.
         """
         notes = []
+
+        # A simulated balance makes dryrun P&L a statement about capital the
+        # account does not hold. Useful for testing the designed strategy, but
+        # it must never be mistaken for a forecast of real returns.
+        if self.trading_mode == "dryrun" and self.dryrun_balance_cents > 0:
+            notes.append(
+                f"Sizing against a SIMULATED ${self.dryrun_balance_cents / 100:.2f} "
+                f"balance (DRYRUN_BALANCE_CENTS), not the real account. P&L here "
+                f"describes that hypothetical account. Ignored in live mode."
+            )
+        if self.trading_mode == "live" and self.dryrun_balance_cents > 0:
+            notes.append(
+                "DRYRUN_BALANCE_CENTS is set but has no effect in live mode; "
+                "sizing uses the real exchange balance"
+            )
 
         # After raising per-trade size, a single full-size losing position can
         # consume the entire day's loss budget and latch the halt. That may be
