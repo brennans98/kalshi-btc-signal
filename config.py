@@ -26,6 +26,46 @@ def _str(name: str, default: str) -> str:
     return (os.getenv(name) or default).strip()
 
 
+# Deployments configured for earlier versions of this bot (and for other Kalshi
+# tooling) use different names for the same two credentials. Accepting the
+# aliases is strictly safer than asking an operator to re-transcribe a private
+# key by hand, which risks corrupting it. The canonical name is listed first and
+# always wins when more than one is present.
+KEY_ID_ALIASES = (
+    "KALSHI_API_KEY_ID",
+    "KALSHI_ACCESS_KEY",
+    "KALSHI_KEY_ID",
+    "ACCESS_KEY",
+)
+
+PRIVATE_KEY_ALIASES = (
+    "KALSHI_PRIVATE_KEY",
+    "KALSHI_PRIVATE_KEY_BASE64",
+    "KALSHI_PEM",
+)
+
+
+def _first_env(names, default: str = "") -> str:
+    """First non-blank value among `names`, else `default`.
+
+    Order matters: `names[0]` is canonical, later entries are legacy aliases.
+    """
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return default
+
+
+def credential_source(names) -> str:
+    """Which alias supplied a credential, for diagnostics. Never the value."""
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return name
+    return ""
+
+
 def _int(name: str, default: int) -> int:
     try:
         return int(float(_str(name, str(default))))
@@ -65,8 +105,8 @@ class Tier:
 class Settings:
     # ---- environment / credentials -------------------------------------
     kalshi_env: str = field(default_factory=lambda: _str("KALSHI_ENV", "demo").lower())
-    key_id: str = field(default_factory=lambda: _str("KALSHI_API_KEY_ID", ""))
-    private_key_pem: str = field(default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY", ""))
+    key_id: str = field(default_factory=lambda: _first_env(KEY_ID_ALIASES, ""))
+    private_key_pem: str = field(default_factory=lambda: _first_env(PRIVATE_KEY_ALIASES, ""))
     series_ticker: str = field(default_factory=lambda: _str("KALSHI_SERIES_TICKER", "KXBTC15M"))
     order_path: str = field(default_factory=lambda: _str("KALSHI_ORDER_PATH", "/portfolio/events/orders"))
     admin_token: str = field(default_factory=lambda: _str("ADMIN_TOKEN", ""))
@@ -518,7 +558,11 @@ class Settings:
         if self.kalshi_env not in ("demo", "prod"):
             issues.append("KALSHI_ENV must be 'demo' or 'prod'")
         if self.is_enabled and not (self.key_id and self.private_key_pem):
-            issues.append("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY are required to trade")
+            issues.append(
+                "A Kalshi API key id and private key are required to trade. "
+                f"Key id: one of {', '.join(KEY_ID_ALIASES)}. "
+                f"Private key: one of {', '.join(PRIVATE_KEY_ALIASES)}."
+            )
         if self.is_live and not self.admin_token:
             issues.append("ADMIN_TOKEN is required in live mode so the kill switch is reachable")
         if self.max_contracts_per_trade < 1:

@@ -580,9 +580,21 @@ def require_admin(token):
 
 @app.get("/api/trader/selftest")
 async def api_selftest(x_admin_token: str = Header(default="")):
-    """Verify credentials and signing without placing an order."""
+    """Verify credentials and signing without placing an order.
+
+    Also reports WHICH env var supplied each credential (names only, never
+    values) so a misconfigured deployment is diagnosable without printing a
+    private key to a terminal.
+    """
     require_admin(x_admin_token)
-    return await client.selftest()
+    result = await client.selftest()
+    if isinstance(result, dict):
+        result = dict(result)
+        result["key_id_var"] = config.credential_source(config.KEY_ID_ALIASES) or None
+        result["private_key_var"] = (
+            config.credential_source(config.PRIVATE_KEY_ALIASES) or None
+        )
+    return result
 
 
 @app.get("/api/trader/tier")

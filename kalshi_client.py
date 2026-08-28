@@ -21,6 +21,7 @@ of every one of them.
 """
 
 import base64
+import binascii
 import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
@@ -44,6 +45,29 @@ class KalshiApiError(RuntimeError):
     """Transport or API error. May be transient."""
 
 
+def _decode_if_base64(text):
+    """Return the PEM inside a base64 blob, or "" when `text` isn't one.
+
+    Some deployments store the key as KALSHI_PRIVATE_KEY_BASE64 — the whole PEM,
+    header lines included, base64-encoded a second time. That is a legitimate
+    way to move a multi-line secret through a single-line env var, so decode it
+    rather than rejecting it. Only used when the raw value has no PEM header,
+    so a real PEM is never round-tripped through this.
+    """
+    candidate = "".join(text.split())
+    if not candidate:
+        return ""
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    try:
+        text_out = decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return text_out if "-----BEGIN" in text_out else ""
+
+
 def _load_private_key(raw):
     if not raw:
         return None
@@ -51,11 +75,19 @@ def _load_private_key(raw):
     # Railway variables commonly arrive with literal backslash-n sequences.
     pem = raw.replace(chr(92) + "n", chr(10)).strip()
 
+    # A PEM always carries a "-----BEGIN" header. Without one, the value may be
+    # a base64-wrapped PEM; try that before failing.
+    if "-----BEGIN" not in pem:
+        unwrapped = _decode_if_base64(pem)
+        if unwrapped:
+            pem = unwrapped.replace(chr(92) + "n", chr(10)).strip()
+
     try:
         return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
     except Exception as error:
         raise KalshiAuthError(
-            f"KALSHI_PRIVATE_KEY could not be parsed as a PEM private key: {error}"
+            "Kalshi private key could not be parsed as a PEM private key "
+            f"(accepted vars: {', '.join(config.PRIVATE_KEY_ALIASES)}): {error}"
         )
 
 
@@ -106,9 +138,15 @@ class KalshiClient:
         if self._key_error:
             return self._key_error
         if not self.key_id:
-            return "KALSHI_API_KEY_ID is not set"
+            return (
+                "No Kalshi API key id found. Set one of: "
+                + ", ".join(config.KEY_ID_ALIASES)
+            )
         if not self.private_key:
-            return "KALSHI_PRIVATE_KEY is not set"
+            return (
+                "No Kalshi private key found. Set one of: "
+                + ", ".join(config.PRIVATE_KEY_ALIASES)
+            )
         return None
 
     def _sign_message(self, message_text):
