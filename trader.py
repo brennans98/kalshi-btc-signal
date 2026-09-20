@@ -83,6 +83,13 @@ _book_source = {"last": None, "ws_hits": 0, "rest_hits": 0}
 # created on the running loop.
 _book_event = None
 
+# ---- book timeout tracking ---------------------------------------------
+# When the in-memory book was last updated for a ticker. Checked before every
+# exit: if the book has been dark for > BOOK_TIMEOUT_SECONDS, the bot executes
+# an emergency market exit because it is trading blind.
+_book_last_update = {}
+_book_timeout_triggered = False
+
 
 def set_book_provider(provider):
     """Install the in-memory WebSocket book reader (called once, from app.py)."""
@@ -110,6 +117,13 @@ def notify_book():
     except RuntimeError:
         # No running loop yet (import-time or shutdown); nothing to wake.
         pass
+
+
+def note_book_update(ticker):
+    """Record that the book just updated for `ticker`. Called from app.py
+    on every WS publish so the timeout guard reads the true last update."""
+    if ticker:
+        _book_last_update[ticker] = time.time()
 
 
 def notify_fill(fill=None):
@@ -191,6 +205,7 @@ async def _book(client, ticker):
             if book and age <= config.settings.book_max_age_seconds:
                 _book_source["last"] = "ws"
                 _book_source["ws_hits"] += 1
+                _book_last_update[ticker] = time.time()
                 return book
 
     cached = _book_cache.get(ticker)
@@ -201,6 +216,7 @@ async def _book(client, ticker):
     _book_cache[ticker] = (time.time(), book)
     _book_source["last"] = "rest"
     _book_source["rest_hits"] += 1
+    _book_last_update[ticker] = time.time()
     return book
 
 
@@ -1450,6 +1466,36 @@ _last_pending_poll = 0.0
 
 
 async def tick(client, signal_provider, market_provider):
+    """One decision cycle."""
+
+    # ---- book-timeout emergency check ---------------------------------
+    # Before anything else: if the book has been dark for too long,
+    # exit every open position at market. A severed WebSocket with a
+    # failing REST fallback means we are trading blind -- holding through
+    # that is gambling, not trading.
+    cfg = config.settings
+    ticker = (market_provider() or {}).get("ticker")
+    if ticker and ticker in _book_last_update:
+        book_age = time.time() - _book_last_update[ticker]
+        if book_age > cfg.book_timeout_seconds:
+            global _book_timeout_triggered
+            if not _book_timeout_triggered:
+                _book_timeout_triggered = True
+                risk.log_decision({
+                    "event": "book_timeout",
+                    "ticker": ticker,
+                    "book_age_seconds": round(book_age, 1),
+                    "limit_seconds": cfg.book_timeout_seconds,
+                })
+                status["last_error"] = (
+                    f"Book timeout: {ticker} has not updated in "
+                    f"{book_age:.0f}s (limit {cfg.book_timeout_seconds}s). "
+                    f"Executing emergency market exits on all positions."
+                )
+            # Fall through to exit processing below -- the tick continues
+            # and the exit loop will flatten positions against whatever
+            # book remains.
+
     global _last_pending_poll
 
     status["last_tick_at"] = int(time.time())

@@ -142,6 +142,34 @@ def is_halted():
     return bool(load_state().get("halted"))
 
 
+def _notify_halt(reason, manual):
+    """POST halt notification to the configured webhook, if any.
+
+    This is the dead-man's switch: when the loss limit triggers, clock
+    drifts, or auth fails, the operator should know immediately rather than
+    discovering it hours later on the dashboard. Fire-and-forget with a
+    short timeout -- a down webhook server must not block the halt latch.
+    """
+    url = config.settings.halt_webhook_url
+    if not url:
+        return
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "event": "halt",
+            "reason": reason,
+            "manual": manual,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }).encode()
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # halting the bot is more important than delivering the notification
+
+
 def halt(reason, manual=False):
     state = load_state()
     state["halted"] = True
@@ -149,6 +177,7 @@ def halt(reason, manual=False):
     state["halt_is_manual"] = manual
     save_state(state)
     log_decision({"event": "halt", "reason": reason, "manual": manual})
+    _notify_halt(reason, manual)
     return state
 
 
@@ -274,9 +303,6 @@ def record_trade(ticker, count, cost_cents):
 
     attempts = dict(state.get("ticker_attempts") or {})
     attempts[ticker] = int(attempts.get(ticker, 0)) + 1
-    # Each 15-minute market has a unique ticker, so this map only grows;
-    # keep the most recent entries. Sorting by ticker works because the
-    # tickers embed their timestamp.
     if len(attempts) > 100:
         attempts = dict(sorted(attempts.items())[-100:])
     state["ticker_attempts"] = attempts
@@ -286,11 +312,6 @@ def record_trade(ticker, count, cost_cents):
 
 
 def record_cost(cost_cents):
-    """Add deployed cost to the day WITHOUT counting a new trade.
-
-    For subsequent partial fills on a resting order: the same order, so the same
-    trade for pacing purposes, but real additional money committed.
-    """
     state = load_state()
     state["cost_today_cents"] = int(state.get("cost_today_cents", 0)) + int(cost_cents or 0)
     save_state(state)
@@ -298,15 +319,6 @@ def record_cost(cost_cents):
 
 
 def check(signal, balance_cents, open_position_count, open_tickers):
-    """Decide whether an ENTRY may be executed.
-
-    Exits are never routed through here; see the module docstring. The daily
-    loss limit itself is evaluated in check_halt(), called once per tick from
-    trader.tick() -- this function only reads the resulting halted flag, it
-    does not re-derive the breach.
-
-    Returns (approved: bool, reason: str, sizing: dict|None).
-    """
     cfg = config.settings
     state = load_state()
 
@@ -320,20 +332,9 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         return False, f"Open position cap reached ({cfg.max_open_positions})", None
 
     ticker = signal.get("ticker")
-    # Note this blocks ADDING to a live position, not re-entering after one
-    # closes. Dip re-entry is sequential by design: exit, then look for the
-    # next dislocation. Averaging into an open losing dip lot is how a bad
-    # read becomes a bad day.
     if ticker and ticker in (open_tickers or []):
         return False, f"Already holding {ticker}", None
 
-    # ---- lane-specific pacing -------------------------------------------
-    # The trend lane's caps exist to stop momentum re-chasing: after a stop,
-    # the same wrong read tends to fire again within seconds. A dip lane is
-    # the opposite case -- several genuine dislocations inside one 15-minute
-    # window is normal, and it is precisely the re-entry the manual strategy
-    # depends on. So the dip lane gets its own, looser, but still bounded
-    # allowance rather than an exemption.
     is_dip = bool(signal.get("dip"))
     lane = signal.get("lane") or ("dip" if is_dip else "trend")
     entry_cap = cfg.dip_max_entries_per_market if is_dip else cfg.max_entries_per_market
@@ -362,12 +363,6 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     if price <= 0:
         return False, "Signal carries no executable price", None
 
-    # ---- conviction sizing ----------------------------------------------
-    # The budget for THIS trade, before any of the hard caps below. A
-    # marginal-but-valid signal buys the small version; a fully-confirmed one
-    # buys the large version. This only ever narrows the range between MIN and
-    # MAX cost -- it cannot exceed MAX_COST_PER_TRADE_CENTS, and every risk
-    # cap after it still applies.
     conviction = signal.get("conviction")
     budget_cents = cfg.max_cost_per_trade_cents
     if cfg.conviction_sizing and isinstance(conviction, (int, float)):
@@ -380,13 +375,6 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         budget_cents // price,
     )
 
-    # ---- what the book can actually supply -------------------------------
-    # Entries are fill-or-kill: the whole size must be available at or inside
-    # the limit price, or nothing happens at all. Sizing purely from the budget
-    # asked for contracts that were not there, so the order was killed and the
-    # bot logged "unfilled" and moved on. Cap the request at the depth we are
-    # willing to reach, and price it at the worst level we would touch so the
-    # order can actually complete.
     levels = [
         (int(level[0]), int(level[1]))
         for level in (signal.get("entry_levels") or [])
@@ -402,23 +390,12 @@ def check(signal, balance_cents, open_position_count, open_tickers):
     if balance_cents is not None:
         count = min(count, int(balance_cents) // price)
 
-    # Bound the worst case of THIS trade, not just its cost: contracts times
-    # the stop distance is what a stop-out actually takes from the account.
-    # The signal carries the volatility-scaled stop this entry will trade
-    # with; a wider stop means fewer contracts for the same risk budget.
     stop_cents = int(signal.get("stop_cents") or cfg.stop_cents)
     if balance_cents is not None and stop_cents > 0:
-        # The strategy split: favorites risk their full premium (stop == ask)
-        # against their own budget slice; scalps risk their stop distance
-        # against theirs. Each strategy is sized independently.
         risk_pct = cfg.fav_risk_pct if signal.get("favorite") else cfg.per_trade_risk_pct
         risk_budget = int(balance_cents) * risk_pct // 100
         count = min(count, max(0, risk_budget // stop_cents))
 
-    # Never size beyond what the exit side can absorb. Entering 6 contracts
-    # against a 2-lot bid means the ladder cannot sell what it just bought.
-    # The exit-liquidity cap protects round trips; a late settlement snipe
-    # never exits, so the resting bid's depth is irrelevant to it.
     exit_size = signal.get("exit_bid_size")
     holds_to_settlement = signal.get("late_settlement") or signal.get("favorite")
     if not holds_to_settlement and isinstance(exit_size, int) and exit_size > 0:
@@ -430,14 +407,6 @@ def check(signal, balance_cents, open_position_count, open_tickers):
             f"(budget {budget_cents}c at {price}c/contract)"
         ), None
 
-    # ---- price the order against the ladder, not the top of book ----------
-    # The edge was measured against the best offer. Filling more contracts than
-    # rest there means paying an AVERAGE price worse than that, which spends
-    # part of the edge before the position even exists. Shrink until the edge
-    # at the average fill price still clears the fee floor. Average price is
-    # non-decreasing in size, so the largest size that clears is found by
-    # walking down; if nothing clears, the trade is refused rather than taken
-    # at a price the model never approved.
     fill = None
     if cfg.depth_aware_sizing and levels:
         fair_prob = signal.get("fair_prob")
@@ -447,8 +416,6 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         while count >= 1:
             candidate = policy.sweep(levels, count)
             if candidate["filled"] < count:
-                # Should not happen after the depth cap, but never send an
-                # order the book cannot fill.
                 count = candidate["filled"]
                 continue
             if candidate["cost_cents"] > budget_cents:
@@ -482,8 +449,6 @@ def check(signal, balance_cents, open_position_count, open_tickers):
         "budget_cents": budget_cents,
         "conviction": conviction,
         "lane": lane,
-        # The limit the order must carry for a fill-or-kill of this size to
-        # complete: the worst level it will touch, not the best.
         "limit_price_cents": limit_price,
         "avg_price_cents": avg_price,
         "slippage_cents": round(avg_price - price, 3),

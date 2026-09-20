@@ -181,9 +181,9 @@ class Settings:
     entry_style: str = field(default_factory=lambda: _str("ENTRY_STYLE", "maker").lower())
     exit_style: str = field(default_factory=lambda: _str("EXIT_STYLE", "maker").lower())
     # ---- which exit engine owns a winner --------------------------------
-    # ladder: the original three fixed rungs (sell 50% at +3c, 30% at +7c,
-    #         20% at +14c). Books profit early and often -- and caps every
-    #         winner at the size of its smallest rung.
+    # ladder: three fixed rungs (sell 40% at +5c, 35% at +9c, 25% at +16c),
+    #         each clearing the fee floor. Books profit early and often -- and
+    #         caps every winner at the size of its largest rung.
     # runner: no fixed rungs. A winner is held behind a volatility-scaled
     #         trailing stop that tightens as the peak grows, is not cut by
     #         max-hold while it is still working, and rides to fee-free
@@ -208,15 +208,27 @@ class Settings:
     )
 
     # ---- the profit ladder ---------------------------------------------
-    # Three targets, hit in order, each selling part of the position. The
-    # small rung banks something quickly and takes the trade off risk; the
-    # large rung is what pays for the stops.
-    small_cents: int = field(default_factory=lambda: _int("SCALP_SMALL_CENTS", 3))
-    small_pct: int = field(default_factory=lambda: _int("SCALP_SMALL_PCT", 50))
-    medium_cents: int = field(default_factory=lambda: _int("SCALP_MEDIUM_CENTS", 7))
-    medium_pct: int = field(default_factory=lambda: _int("SCALP_MEDIUM_PCT", 30))
-    large_cents: int = field(default_factory=lambda: _int("SCALP_LARGE_CENTS", 14))
-    large_pct: int = field(default_factory=lambda: _int("SCALP_LARGE_PCT", 20))
+    # Three targets, hit in order, each selling part of the position.
+    #
+    # REWORKED: the old rungs (50% at +3c, 30% at +7c, 20% at +14c) were
+    # structurally weak. A taker round trip on KXBTC15M costs ~3-4c per
+    # contract, so the +3c small rung sold HALF the position at a net loss
+    # and the +7c rung barely broke even -- only the +14c rung paid. A
+    # ladder whose first two rungs lose money after fees is not a ladder.
+    #
+    # The new rungs clear the fee floor with margin at every level:
+    #   small  +5c  40%   banks above the round-trip cost
+    #   medium +9c  35%   the expected case, solidly net-positive
+    #   large  +16c 25%   the tail that pays for the stops
+    # Every rung is now net-profitable after a taker round trip. The config
+    # validator enforces that each target clears the fee floor, so a future
+    # edit cannot quietly reintroduce a loss-making rung.
+    small_cents: int = field(default_factory=lambda: _int("SCALP_SMALL_CENTS", 5))
+    small_pct: int = field(default_factory=lambda: _int("SCALP_SMALL_PCT", 40))
+    medium_cents: int = field(default_factory=lambda: _int("SCALP_MEDIUM_CENTS", 9))
+    medium_pct: int = field(default_factory=lambda: _int("SCALP_MEDIUM_PCT", 35))
+    large_cents: int = field(default_factory=lambda: _int("SCALP_LARGE_CENTS", 16))
+    large_pct: int = field(default_factory=lambda: _int("SCALP_LARGE_PCT", 25))
 
     # ---- chart analysis --------------------------------------------------
     # The chart read (indicators.py) that gates every entry. EMAs on bar
@@ -482,6 +494,21 @@ class Settings:
     # above zero to sell that slice once the gain reaches PARTIAL_CENTS.
     runner_partial_pct: int = field(default_factory=lambda: _int("RUNNER_PARTIAL_PCT", 0))
     runner_partial_cents: int = field(default_factory=lambda: _int("RUNNER_PARTIAL_CENTS", 10))
+    # ---- alerting & safety ---------------------------------------------------
+    # Webhook URL called when the bot halts (loss limit, clock fault, auth
+    # error). POSTs JSON with halt reason and timestamp. Empty = no webhook.
+    halt_webhook_url: str = field(default_factory=lambda: _str("HALT_WEBHOOK_URL", ""))
+    # How long the book may be stale before the loop triggers an emergency
+    # market exit on every open position. A book that has not updated in this
+    # many seconds means the WebSocket is severed and the REST fallback is
+    # also failing -- the position is blind and must be flattened.
+    book_timeout_seconds: float = field(default_factory=lambda: _float("BOOK_TIMEOUT_SECONDS", 10.0))
+    # When conviction scoring, book imbalance below this threshold (negative
+    # means resting size is evaporating on our side) forces conviction to 0
+    # rather than blending it. At -0.5, the book is actively hostile to our
+    # direction and "medium conviction" is dangerously misleading.
+    imbalance_veto_threshold: float = field(default_factory=lambda: _float("IMBALANCE_VETO_THRESHOLD", -0.5))
+
 
     # ---- chop filter -----------------------------------------------------
     # Kaufman efficiency ratio of the BTC tape: |net move| / sum of |one-
@@ -587,6 +614,17 @@ class Settings:
             issues.append("Scalp targets must increase: small < medium < large")
         if small.pct + medium.pct + large.pct != 100:
             issues.append("SCALP_SMALL_PCT + SCALP_MEDIUM_PCT + SCALP_LARGE_PCT must equal 100")
+        # Every rung must clear a round-trip's fees or the ladder sells part
+        # of the position at a net loss. 3.5c is the conservative taker
+        # round-trip cost at the ~50c midpoint on this series.
+        ladder_fee_floor = 3.5 + self.fee_safety_margin_cents
+        for rung in self.tiers():
+            if rung.cents < ladder_fee_floor:
+                issues.append(
+                    f"Ladder rung '{rung.name}' target {rung.cents}c is below the "
+                    f"~{ladder_fee_floor:.1f}c round-trip fee floor -- it would sell "
+                    f"at a net loss"
+                )
         if self.stop_cents < 1:
             issues.append("SCALP_STOP_CENTS must be at least 1")
         if self.small_lot_exit_tier not in TIER_NAMES:
@@ -761,6 +799,8 @@ class Settings:
             issues.append("TRADE_LOOP_SECONDS must be positive")
         if self.loop_min_seconds < 0:
             issues.append("TRADE_LOOP_MIN_SECONDS cannot be negative")
+        if self.book_timeout_seconds < 5:
+                result.append(f"BOOK_TIMEOUT_SECONDS={self.book_timeout_seconds}s is very low -- normal WS blips may trigger emergency exits")
         if self.loop_min_seconds > self.loop_seconds:
             issues.append(
                 "TRADE_LOOP_MIN_SECONDS must be <= TRADE_LOOP_SECONDS, or the "
@@ -936,6 +976,9 @@ class Settings:
             "runner_hold_winners": bool(self.runner_hold_winners),
             "runner_partial_pct": self.runner_partial_pct,
             "runner_partial_cents": self.runner_partial_cents,
+            "halt_webhook_url": ("configured" if self.halt_webhook_url else ""),
+            "book_timeout_seconds": self.book_timeout_seconds,
+            "imbalance_veto_threshold": self.imbalance_veto_threshold,
             "spot_feeds": self.spot_feeds,
             "spot_divergence_bps": self.spot_divergence_bps,
             "spot_min_sources": self.spot_min_sources,

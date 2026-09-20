@@ -519,6 +519,12 @@ def bid_for_side(snapshot, side):
     return (snapshot or {}).get("yes_bid" if side == "yes" else "no_bid")
 
 
+# Divergence veto counter: how many entries the spot divergence check has
+# blocked since boot. Exposed in /api/state so you can see if
+# SPOT_DIVERGENCE_BPS is blocking entries during the conditions you want.
+divergence_veto_count = 0
+
+
 def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     """Return a signal dict. action is 'BUY YES', 'BUY NO', or 'NO TRADE'.
 
@@ -560,6 +566,8 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     if spot_status:
         fresh_sources = spot_status.get("fresh_sources") or 0
         if fresh_sources < cfg.spot_min_sources:
+            global divergence_veto_count
+            divergence_veto_count += 1
             return _no_trade(
                 f"Only {fresh_sources} fresh spot feed(s), "
                 f"{cfg.spot_min_sources} required for cross-confirmation"
@@ -567,7 +575,9 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
         divergence = spot_status.get("divergence_bps")
         if divergence is not None and divergence > cfg.spot_divergence_bps:
             return _no_trade(
-                f"Spot feeds disagree by {divergence:.1f}bps "
+                global divergence_veto_count
+            divergence_veto_count += 1
+            divergence_reason = f"Spot feeds disagree by {divergence:.1f}bps "
                 f"(limit {cfg.spot_divergence_bps:.1f}bps) -- fair value is not "
                 f"trustworthy while the venues are apart"
             )
@@ -889,6 +899,10 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
         decel_ok = bool(tape["decelerating"]) or not cfg.dip_require_decel
         imbalance = tape["imbalance"]
         imbalance_ok = imbalance is None or imbalance >= cfg.dip_min_imbalance
+        imbalance_veto = (
+            imbalance is not None
+            and imbalance < cfg.imbalance_veto_threshold
+        )
         dip_edge_floor = max(cfg.dip_min_edge_cents, fee_cents_per_contract + cfg.fee_safety_margin_cents)
 
         # Exhaustion on the SPOT read, in the direction that would have pushed
@@ -947,7 +961,7 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
                 # Edge beyond the fee floor -- the part that is actually ours.
                 (3.0, (edge - dip_edge_floor) / max(1.0, 2 * dip_edge_floor)),
                 # Bid rebuilding underneath us.
-                (1.5, 0.5 if imbalance is None else (imbalance + 1) / 2),
+                (1.5, 0.0 if imbalance_veto else (0.5 if imbalance is None else (imbalance + 1) / 2)),
                 # The fall has actually stopped, not just slowed.
                 (1.5, 1.0 if tape["decelerating"] else 0.0),
                 # Room for the recovery to happen.

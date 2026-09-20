@@ -42,11 +42,6 @@ from kalshi_client import KalshiApiError, KalshiAuthError, KalshiClient
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# The spot tape is owned by feeds.hub, which runs several exchange sockets at
-# once and writes a consensus (median) print. A single-venue feed cannot tell a
-# real move from that venue's own glitch, and acting on a glitch is worse than
-# missing a move. `trades` is the same (timestamp, price) deque shape the rest
-# of this module already expects, so nothing downstream changes.
 trades = feeds.hub.trades
 
 state = {
@@ -67,13 +62,6 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.middleware("http")
 async def no_cache_headers(request: Request, call_next):
-    """Every response is either live data or a tiny document.
-
-    Browsers (and PWA installs) aggressively cache HTML, JSON and manifests;
-    a stale dashboard silently showing yesterday's signal is worse than the
-    few bytes saved. This is the FastAPI equivalent of Flask's
-    SEND_FILE_MAX_AGE_DEFAULT = 0, applied to /static as well.
-    """
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -82,34 +70,24 @@ async def no_cache_headers(request: Request, call_next):
 
 client = KalshiClient()
 
-# Reconstructed book state for the WebSocket path. orderbook_snapshot gives the
-# full book; orderbook_delta gives one price level change at a time. Kept
-# separate from state["orderbook"] (the published, policy-consumable shape) so
-# a partial or out-of-order delta never corrupts what the trader reads.
 _local_book = {"ticker": None, "yes": {}, "no": {}}
 
 
 def pct_move(seconds_ago):
     if len(trades) < 2:
         return None
-
     cutoff = time.time() - seconds_ago
     earlier = None
-
     for timestamp, price in trades:
         if timestamp <= cutoff:
             earlier = price
         else:
             break
-
     if earlier is None:
         return None
-
     return ((trades[-1][1] - earlier) / earlier) * 100
 
 
-# The trader takes two providers rather than one combined object, so the signal
-# and the market can each be read at the moment it is needed.
 def current_signal():
     return policy.evaluate(
         list(trades),
@@ -125,58 +103,35 @@ def current_market():
 
 
 def public_trade_log(limit=30):
-    """Recent executed entries and exits, shaped for the dashboard table.
-
-    Only completed actions (opened/simulated entries, exited/simulated exits)
-    are included, with a fixed field projection -- raw decision records carry
-    full order responses and signal internals that stay behind the admin
-    endpoint.
-    """
     events = []
-
     for record in risk.read_decisions(200):
         event = record.get("event")
-
         if event == "entry" and record.get("outcome") in ("opened", "simulated"):
             signal = record.get("signal") or {}
             sizing = record.get("sizing") or {}
-            events.append(
-                {
-                    "at": record.get("logged_at"),
-                    "type": "entry",
-                    "mode": record.get("mode"),
-                    "ticker": signal.get("ticker"),
-                    "side": signal.get("side"),
-                    "count": sizing.get("count"),
-                    "price_cents": signal.get("price_cents"),
-                    "realized_cents": None,
-                    "detail": signal.get("reason"),
-                }
-            )
+            events.append({
+                "at": record.get("logged_at"), "type": "entry",
+                "mode": record.get("mode"), "ticker": signal.get("ticker"),
+                "side": signal.get("side"), "count": sizing.get("count"),
+                "price_cents": signal.get("price_cents"),
+                "realized_cents": None, "detail": signal.get("reason"),
+            })
         elif event == "exit" and record.get("outcome") in ("exited", "simulated"):
-            events.append(
-                {
-                    "at": record.get("logged_at"),
-                    "type": "exit",
-                    "mode": record.get("mode"),
-                    "ticker": record.get("ticker"),
-                    "side": record.get("side"),
-                    "count": record.get("count"),
-                    "price_cents": record.get("limit_price_cents"),
-                    "realized_cents": record.get("realized_cents"),
-                    "detail": record.get("reason"),
-                }
-            )
-
+            events.append({
+                "at": record.get("logged_at"), "type": "exit",
+                "mode": record.get("mode"), "ticker": record.get("ticker"),
+                "side": record.get("side"), "count": record.get("count"),
+                "price_cents": record.get("limit_price_cents"),
+                "realized_cents": record.get("realized_cents"),
+                "detail": record.get("reason"),
+            })
         if len(events) >= limit:
             break
-
     return events
 
 
 def api_payload():
     market = state["market"] or {}
-
     return {
         "signal": current_signal(),
         "btc_usd": trades[-1][1] if trades else None,
@@ -184,10 +139,8 @@ def api_payload():
         "move_60s": pct_move(60),
         "spot_connected": feeds.hub.status()["connected_any"],
         "last_error": feeds.hub.status()["error"],
-        # Per-venue health and cross-venue disagreement. When the venues
-        # disagree beyond SPOT_DIVERGENCE_BPS the policy stops trading rather
-        # than pick a winner, so this is worth showing.
         "spot_feeds": feeds.hub.status(),
+        "divergence_veto_count": policy.divergence_veto_count,
         "kalshi": {
             "status": state["kalshi_status"],
             "error": state["kalshi_error"],
@@ -200,8 +153,6 @@ def api_payload():
             "book_error": state["book_error"],
             "book_updated_at": state["book_updated_at"],
             "book_source": state["book_source"],
-            # The contract's OWN recent price action -- the series the bot
-            # previously had no record of at all.
             "tape": booktape.view(market.get("ticker")),
         },
         "trader": trader.snapshot(client),
@@ -211,32 +162,18 @@ def api_payload():
     }
 
 
-# ------------------------------------------------------------- feeds
-
-
 def choose_market(markets):
-    """The soonest-closing market that still has enough runway to scalp.
-
-    Picking the absolute soonest close would hand the trader a market it must
-    immediately reject, and it would keep re-picking it while a scalpable
-    market sat one slot behind.
-    """
     cfg = config.settings
     candidates = []
-
     for market in markets:
         if market.get("status") not in ("active", "open") or not market.get("ticker"):
             continue
-
         remaining = policy.seconds_to_close(market)
         if remaining is None or remaining < cfg.min_seconds_to_close:
             continue
-
         candidates.append((remaining, market))
-
     if not candidates:
         return None
-
     candidates.sort(key=lambda item: item[0])
     return candidates[0][1]
 
@@ -247,7 +184,6 @@ async def kalshi_market_discovery_worker():
             payload = await client.get_markets(config.settings.series_ticker)
             market = choose_market(payload.get("markets", []))
             state["kalshi_checked_at"] = int(time.time())
-
             if market is None:
                 state["kalshi_status"] = "No scalpable BTC-15m market in the window"
                 state["kalshi_error"] = None
@@ -261,21 +197,12 @@ async def kalshi_market_discovery_worker():
                 if market.get("ticker") != previous:
                     state["orderbook"] = None
                     state["book_published_at"] = None
-                    # Drop the previous contract's tape. A new 15-minute
-                    # market is a new instrument; carrying the old one's
-                    # highs and lows across the roll would manufacture a
-                    # dip that never happened.
                     if previous:
                         booktape.forget(previous)
-
         except Exception as error:
             state["kalshi_status"] = "Market discovery error"
             state["kalshi_error"] = str(error)[:180]
-
         await asyncio.sleep(20)
-
-
-# ------------------------------------------------------------- Kalshi orderbook
 
 
 def _reset_local_book(ticker):
@@ -285,11 +212,6 @@ def _reset_local_book(ticker):
 
 
 def _price_cents(value):
-    """Normalize a book price to integer cents.
-
-    Kalshi's WS channel now sends fixed-point dollar strings ('0.9600');
-    older payloads sent integer cents. Strings are dollars, numbers are cents.
-    """
     try:
         if isinstance(value, str):
             return int(round(float(value) * 100))
@@ -299,8 +221,6 @@ def _price_cents(value):
 
 
 def _count(value):
-    """Contract counts are fixed-point strings ('54.00', '13832.11') on the
-    current WS channel and integers on older payloads."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -308,7 +228,6 @@ def _count(value):
 
 
 def _apply_book_levels(side, levels):
-    """levels: list of [price, count] pairs representing the full side."""
     book_side = {}
     for level in levels or []:
         if not isinstance(level, (list, tuple)) or len(level) < 2:
@@ -342,21 +261,12 @@ def _publish_local_book():
     }
     state["book_error"] = None
     state["book_updated_at"] = int(time.time())
-    # Sub-second precision, separately from the display timestamp above: the
-    # trader uses this to decide whether the in-memory book is fresh enough to
-    # trade on, and a 1-second-resolution integer cannot answer that.
     state["book_published_at"] = time.time()
     state["book_source"] = "websocket"
-
-    # Record this snapshot on the contract's own tape. This is what lets the
-    # strategy see the dip in the CONTRACT rather than inferring it from BTC.
     ticker = _local_book["ticker"]
     if ticker:
-        # booktape wants the normalized top-of-book shape, not the raw levels.
         booktape.record(ticker, policy.book_snapshot(state["orderbook"]))
-
-    # And wake the trading loop, so exits are evaluated on the delta that
-    # moved the price instead of on the next scheduled poll.
+    trader.note_book_update(ticker)
     trader.notify_book()
 
 
@@ -366,25 +276,16 @@ def _handle_ws_message(raw_message, ticker):
     body = data.get("msg") or {}
 
     if msg_type == "fill":
-        # One of OUR orders just traded. The fill channel is account-wide, so
-        # this fires for any market, including one we have rolled off of --
-        # exactly the case where a lingering resting order must be noticed.
-        # The push is a wake-up, not a source of truth: the trader immediately
-        # re-polls order status over REST, which remains authoritative for
-        # counts, prices and fees.
         trader.notify_fill(body)
         return
 
     if body.get("market_ticker") not in (None, ticker):
-        return  # a stale message for a market we've since rolled off of
+        return
 
     if msg_type == "orderbook_snapshot":
-        # Current channel: yes_dollars_fp/no_dollars_fp with [price_dollars,
-        # count_fp] string pairs. Legacy fallback: yes/no with integer cents.
         _apply_book_levels("yes", body.get("yes_dollars_fp") or body.get("yes"))
         _apply_book_levels("no", body.get("no_dollars_fp") or body.get("no"))
         _publish_local_book()
-
     elif msg_type == "orderbook_delta":
         side = body.get("side")
         price = body.get("price_dollars", body.get("price"))
@@ -392,7 +293,6 @@ def _handle_ws_message(raw_message, ticker):
         if side in ("yes", "no") and price is not None and delta is not None:
             _apply_book_delta(side, price, delta)
             _publish_local_book()
-
     elif msg_type == "error":
         code = (body or {}).get("code")
         message = (body or {}).get("msg")
@@ -400,69 +300,37 @@ def _handle_ws_message(raw_message, ticker):
 
 
 async def kalshi_orderbook_ws_worker():
-    """Stream orderbook_delta over WebSocket instead of REST polling.
-
-    Kalshi pushes book changes the instant they happen; a 2-second REST poll
-    means every decision is made against a price that may already be gone.
-    The REST fallback worker below only writes when this path has gone stale,
-    so the fast path always wins while it is healthy.
-    """
     backoff = 1
-
     while True:
         ticker = (state["market"] or {}).get("ticker")
-
         if not ticker or not client.has_credentials:
             await asyncio.sleep(2)
             continue
-
         if _local_book["ticker"] != ticker:
             _reset_local_book(ticker)
-
         try:
             headers = client.sign_ws_handshake()
             async with websockets.connect(
-                client.ws_url,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=20,
+                client.ws_url, additional_headers=headers,
+                ping_interval=20, ping_timeout=20,
             ) as websocket:
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "id": 1,
-                            "cmd": "subscribe",
-                            "params": {
-                                "channels": ["orderbook_delta"],
-                                "market_tickers": [ticker],
-                            },
-                        }
-                    )
-                )
-                # The fill channel is private and account-wide: every fill on
-                # our own orders is pushed the instant it happens, replacing
-                # PENDING_POLL_SECONDS of REST-poll latency with a push.
-                # Subscribed separately because it takes no market_tickers --
-                # scoping it to the current market would go blind to fills on
-                # a market we have just rolled off of.
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "id": 2,
-                            "cmd": "subscribe",
-                            "params": {"channels": ["fill"]},
-                        }
-                    )
-                )
-
+                await websocket.send(json.dumps({
+                    "id": 1, "cmd": "subscribe",
+                    "params": {
+                        "channels": ["orderbook_delta"],
+                        "market_tickers": [ticker],
+                    },
+                }))
+                await websocket.send(json.dumps({
+                    "id": 2, "cmd": "subscribe",
+                    "params": {"channels": ["fill"]},
+                }))
                 backoff = 1
                 subscribed_ticker = ticker
-
                 async for raw_message in websocket:
                     if (state["market"] or {}).get("ticker") != subscribed_ticker:
-                        break  # market rolled to the next contract, reconnect on it
+                        break
                     _handle_ws_message(raw_message, subscribed_ticker)
-
         except Exception as error:
             state["book_error"] = f"ws: {str(error)[:160]}"
             await asyncio.sleep(backoff)
@@ -470,40 +338,24 @@ async def kalshi_orderbook_ws_worker():
 
 
 async def kalshi_keepalive_worker():
-    """Keep the REST connection pool warm between orders.
-
-    Orders are placed over REST. The pool holds connections open, but a
-    quiet stretch longer than the idle timeout silently drops them, and the
-    next order pays a fresh TCP+TLS handshake at the worst possible moment.
-    A cheap public request every 20s -- well inside the client's 50s
-    keepalive_expiry -- keeps an established connection ready.
-    """
     while True:
         await asyncio.sleep(20)
         try:
             await client.warm()
         except Exception:
-            pass  # transient failure; the next order will reconnect anyway
+            pass
 
 
 async def orderbook_rest_fallback_worker():
-    """REST polling safety net.
-
-    Only writes when the WebSocket book has gone stale (or was never
-    established), so the fast path always wins when it is healthy.
-    """
     while True:
         ticker = (state["market"] or {}).get("ticker")
-
         if not ticker:
             await asyncio.sleep(2)
             continue
-
         book_age = (
             time.time() - state["book_updated_at"] if state["book_updated_at"] else None
         )
         is_stale = book_age is None or book_age > (config.settings.book_poll_seconds * 3)
-
         if is_stale:
             try:
                 fresh = await client.get_orderbook(ticker)
@@ -514,18 +366,10 @@ async def orderbook_rest_fallback_worker():
                     state["book_source"] = "rest_fallback"
             except Exception as error:
                 state["book_error"] = f"rest: {str(error)[:160]}"
-
         await asyncio.sleep(config.settings.book_poll_seconds)
 
 
 def _live_book(ticker):
-    """The in-memory WebSocket book, for the trader's exit path.
-
-    Returns (book, published_at_epoch) or None. The trader calls this instead
-    of fetching the book over REST, which is the single largest latency win
-    available here: the book is already in this process, applied delta by
-    delta as Kalshi pushes it.
-    """
     if not ticker or (state["market"] or {}).get("ticker") != ticker:
         return None
     book = state["orderbook"]
@@ -536,15 +380,12 @@ def _live_book(ticker):
 
 @app.on_event("startup")
 async def startup():
-    # One task per spot venue; the hub merges them into a consensus tape.
     for task in feeds.hub.tasks():
         asyncio.create_task(task)
-
     asyncio.create_task(kalshi_market_discovery_worker())
     asyncio.create_task(kalshi_orderbook_ws_worker())
     asyncio.create_task(orderbook_rest_fallback_worker())
     asyncio.create_task(kalshi_keepalive_worker())
-
     if config.settings.is_enabled:
         trader.set_book_provider(_live_book)
         asyncio.create_task(trader.loop(client, current_signal, current_market))
@@ -553,9 +394,6 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await client.aclose()
-
-
-# ------------------------------------------------------------- routes
 
 
 @app.get("/")
@@ -570,26 +408,13 @@ async def api_state():
 
 @app.get("/api/stream")
 async def api_stream():
-    """Server-sent events: the /api/state payload pushed once per second.
-
-    The dashboard prefers this over polling; if the connection drops (proxy
-    timeout, mobile sleep) the frontend falls back to fetch polling until the
-    stream resumes.
-    """
-
     async def event_stream():
         while True:
             yield f"data: {json.dumps(api_payload())}\n\n"
             await asyncio.sleep(1)
-
     return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-store",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -610,9 +435,6 @@ async def manifest():
     return FileResponse(STATIC_DIR / "manifest.webmanifest")
 
 
-# ------------------------------------------------------------- admin
-
-
 def require_admin(token):
     expected = config.settings.admin_token
     if not expected:
@@ -623,26 +445,17 @@ def require_admin(token):
 
 @app.get("/api/trader/selftest")
 async def api_selftest(x_admin_token: str = Header(default="")):
-    """Verify credentials and signing without placing an order.
-
-    Also reports WHICH env var supplied each credential (names only, never
-    values) so a misconfigured deployment is diagnosable without printing a
-    private key to a terminal.
-    """
     require_admin(x_admin_token)
     result = await client.selftest()
     if isinstance(result, dict):
         result = dict(result)
         result["key_id_var"] = config.credential_source(config.KEY_ID_ALIASES) or None
-        result["private_key_var"] = (
-            config.credential_source(config.PRIVATE_KEY_ALIASES) or None
-        )
+        result["private_key_var"] = config.credential_source(config.PRIVATE_KEY_ALIASES) or None
     return result
 
 
 @app.get("/api/trader/tier")
 async def api_tier(x_admin_token: str = Header(default="")):
-    """Current API usage tier and token-bucket limits."""
     require_admin(x_admin_token)
     try:
         return await client.get_api_limits()
@@ -652,12 +465,6 @@ async def api_tier(x_admin_token: str = Header(default="")):
 
 @app.post("/api/trader/tier/upgrade")
 async def api_tier_upgrade(x_admin_token: str = Header(default="")):
-    """Request the Advanced usage tier.
-
-    Requires at least 1 of the account's last 100 Predictions orders to have
-    been placed via the API. Dryrun mode never satisfies this since it never
-    calls create_order/sell -- only a real (live) order counts.
-    """
     require_admin(x_admin_token)
     try:
         return await client.upgrade_api_tier()
@@ -673,66 +480,37 @@ async def api_halt(x_admin_token: str = Header(default="")):
 
 @app.post("/api/trader/resume")
 async def api_resume(x_admin_token: str = Header(default="")):
-    """Clear a halt and restart the day's loss accounting from the current
-    balance. Resuming is a human decision that the account may trade again;
-    measuring the day from the balance that person just looked at keeps the
-    loss limit honest after deposits (see risk.resume)."""
     require_admin(x_admin_token)
     return risk.resume(rebaseline_balance=trader.status.get("balance_cents"))
 
 
 @app.post("/api/trader/flatten")
 async def api_flatten(x_admin_token: str = Header(default="")):
-    """Halt entries, then sell every open scalp at the current bid.
-
-    Deliberately works even when TRADING_MODE is "off": a position left over
-    from an earlier live session is exactly what an emergency flatten needs to
-    be able to reach.
-    """
     require_admin(x_admin_token)
     risk.halt("Flattened manually via API", manual=True)
-
     lot_mode = config.settings.trading_mode
     if lot_mode == "off":
         lot_mode = "live"
-
     closed = []
-
-    # Resting orders first: cancel pending maker entries so nothing new can
-    # fill mid-flatten, and absorb any last-instant fills into lots so the
-    # sweep below sells them too.
     if lot_mode == "live":
         for pending_key, pending in scalp.pending_all("live").items():
             try:
-                await trader._cancel_pending_entry(
-                    client, pending_key, pending, "Manual flatten via API"
-                )
+                await trader._cancel_pending_entry(client, pending_key, pending, "Manual flatten via API")
             except (KalshiApiError, KalshiAuthError) as error:
-                closed.append(
-                    {"ticker": pending.get("ticker"), "error": str(error)[:140]}
-                )
-
+                closed.append({"ticker": pending.get("ticker"), "error": str(error)[:140]})
     for lot in scalp.open_lots(lot_mode):
         try:
             book = await client.get_orderbook(lot["ticker"])
         except (KalshiApiError, KalshiAuthError) as error:
             closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
             continue
-
         bid = policy.bid_for_side(policy.book_snapshot(book), lot["side"])
         if bid is None:
-            closed.append(
-                {"ticker": lot["ticker"], "error": "no resting bid to sell into"}
-            )
+            closed.append({"ticker": lot["ticker"], "error": "no resting bid to sell into"})
             continue
-
         marked = scalp.mark(lot_mode, lot["key"], bid)
         if not marked:
             continue
-
-        # Pull the lot's resting ladder rungs off the book before the taker
-        # sell, so the flatten cannot race our own asks (and any rung fills
-        # that land during the cancel are recorded, not sold twice).
         if lot_mode == "live":
             try:
                 marked = await trader._cancel_exit_orders(client, marked)
@@ -740,52 +518,29 @@ async def api_flatten(x_admin_token: str = Header(default="")):
                 closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
                 continue
             if (marked.get("count_open") or 0) <= 0:
-                closed.append(
-                    {
-                        "ticker": lot["ticker"],
-                        "side": lot["side"],
-                        "sold": 0,
-                        "note": "fully closed by resting ladder fills",
-                        "still_open": 0,
-                    }
-                )
+                closed.append({"ticker": lot["ticker"], "side": lot["side"], "sold": 0,
+                               "note": "fully closed by resting ladder fills", "still_open": 0})
                 continue
-
         wanted = marked["count_open"]
         intent = {
-            "tier": "manual",
-            "kind": "time",
-            "count": wanted,
+            "tier": "manual", "kind": "time", "count": wanted,
             "limit_price": max(1, min(99, int(round(bid)))),
             "reason": "Manual flatten via API",
         }
-
         try:
             await trader._execute_exit(client, lot_mode, marked, intent)
         except (KalshiApiError, KalshiAuthError) as error:
             closed.append({"ticker": lot["ticker"], "error": str(error)[:140]})
             continue
-
         remaining = (scalp.get(lot_mode, lot["key"]) or {}).get("count_open") or 0
-        closed.append(
-            {
-                "ticker": lot["ticker"],
-                "side": lot["side"],
-                "sold": wanted - remaining,
-                "price_cents": intent["limit_price"],
-                "still_open": remaining,
-            }
-        )
-
+        closed.append({"ticker": lot["ticker"], "side": lot["side"],
+                       "sold": wanted - remaining, "price_cents": intent["limit_price"],
+                       "still_open": remaining})
     return {"halted": True, "mode": lot_mode, "closed": closed}
 
 
 @app.get("/api/trader/fills")
 async def api_fills(x_admin_token: str = Header(default=""), limit: int = 200):
-    """Raw fills straight from Kalshi's records, for auditing what actually
-    traded. The bot's own logs describe intent; this endpoint is the ground
-    truth to reconcile them against (entries, exits, prices, fee treatment).
-    """
     require_admin(x_admin_token)
     try:
         payload = await client.get_fills(limit=min(int(limit), 1000))
@@ -796,12 +551,9 @@ async def api_fills(x_admin_token: str = Header(default=""), limit: int = 200):
 
 @app.get("/api/trader/settlements")
 async def api_settlements(x_admin_token: str = Header(default=""), limit: int = 200):
-    """Settled-market results from Kalshi: what each position finally paid."""
     require_admin(x_admin_token)
     try:
-        payload = await client.request(
-            "GET", "/portfolio/settlements", params={"limit": min(int(limit), 1000)}
-        )
+        payload = await client.request("GET", "/portfolio/settlements", params={"limit": min(int(limit), 1000)})
     except (KalshiApiError, KalshiAuthError) as error:
         return {"error": str(error)}
     return payload
@@ -816,8 +568,4 @@ async def api_decisions(limit: int = 50, x_admin_token: str = Header(default="")
 @app.get("/api/trader/scalps")
 async def api_scalps(x_admin_token: str = Header(default="")):
     require_admin(x_admin_token)
-    return {
-        "live": scalp.view("live"),
-        "dryrun": scalp.view("dryrun"),
-        "active_mode": config.settings.trading_mode,
-    }
+    return {"live": scalp.view("live"), "dryrun": scalp.view("dryrun"), "active_mode": config.settings.trading_mode}
