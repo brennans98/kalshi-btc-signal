@@ -537,6 +537,7 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     but the market expires on theirs, so a drifting clock is treated as a
     trading fault rather than absorbed silently.
     """
+     global divergence_veto_count
     cfg = config.settings
 
     # Checked before anything else because a wrong clock corrupts every other
@@ -566,14 +567,12 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     if spot_status:
         fresh_sources = spot_status.get("fresh_sources") or 0
         if fresh_sources < cfg.spot_min_sources:
-            global divergence_veto_count
             divergence_veto_count += 1
             return _no_trade(
                 f"Only {fresh_sources} fresh spot feed(s), "
                 f"{cfg.spot_min_sources} required for cross-confirmation"
             )
         if divergence is not None and divergence > cfg.spot_divergence_bps:
-            global divergence_veto_count
             divergence_veto_count += 1
             return _no_trade(
                 f"Spot feeds disagree by {divergence:.1f}bps "
