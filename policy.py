@@ -572,7 +572,8 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
                 f"Only {fresh_sources} fresh spot feed(s), "
                 f"{cfg.spot_min_sources} required for cross-confirmation"
             )
-        if divergence is not None and divergence > cfg.spot_divergence_bps:
+      divergence = spot_status.get("divergence_bps")
+      if divergence is not None and divergence > cfg.spot_divergence_bps:
             divergence_veto_count += 1
             return _no_trade(
                 f"Spot feeds disagree by {divergence:.1f}bps "
