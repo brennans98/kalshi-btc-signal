@@ -537,7 +537,7 @@ def evaluate(trades, market, orderbook, spot_status=None, clock_status=None):
     but the market expires on theirs, so a drifting clock is treated as a
     trading fault rather than absorbed silently.
     """
-     global divergence_veto_count
+    global divergence_veto_count
     cfg = config.settings
 
     # Checked before anything else because a wrong clock corrupts every other
